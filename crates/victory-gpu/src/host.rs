@@ -771,6 +771,16 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// A shader that can store to buffers was bound since the list's last
+    /// wait for every earlier shader write (`crate::indirect`): an indirect
+    /// call's arguments may be among what it wrote. Set when the list is
+    /// made or reset (earlier lists' writes are not known here).
+    buffer_writes: std::sync::atomic::AtomicBool,
+    /// A shader that can write through any unordered access (buffers,
+    /// textures, views picked from the heap by index) was bound since the
+    /// list's last wait for every earlier shader write: the title's barrier
+    /// groups wait only then (`crate::list`). Set when made or reset.
+    shader_writes: std::sync::atomic::AtomicBool,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -1560,6 +1570,10 @@ struct CardRange {
 /// What a submission does for copies in the card's memory.
 struct CardPlan {
     ranges: Vec<CardRange>,
+    /// With [`relay`]: the number its sends were taken under
+    /// ([`QUEUE_ORDER`]). Once its submission has run, every send up to it
+    /// has run (`Host::relay_card_back` on a copy queue).
+    sent_as: u64,
     /// The compare, run after the submission's lists.
     check: Option<ID3D12CommandList>,
     /// The copies whose card side was brought up to date, alive until the
@@ -1815,6 +1829,17 @@ static LINE_LANDED: std::sync::Condvar = std::sync::Condvar::new();
 /// fetch sent with the count at N ran behind sends 1..N and ahead of every
 /// later one.
 static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
+
+/// With [`relay`]: the thread that lands flights fetches card copies'
+/// pieces on a copy queue of its own. On the host's queue a fetch ran
+/// behind everything sent after the flights it lands (up to 128 lists of
+/// later frames): run 20261124-1508, 9 fetches a frame waited 187 ms in all
+/// while the card had finished the flights long before.
+/// `VICTORY_RELAY_COPY_QUEUE=0` puts them on the host's queue again.
+fn relay_copy_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY_QUEUE").is_none_or(|v| v != "0"))
+}
 
 /// Since the last frame-rate line, of the thread that lands flights
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
@@ -2344,6 +2369,9 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
+    /// A copy queue of the fetch's own ([`relay_copy_queue`]); without one
+    /// the fetch goes on the host's queue.
+    copy: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -2860,6 +2888,8 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                buffer_writes: std::sync::atomic::AtomicBool::new(true),
+                shader_writes: std::sync::atomic::AtomicBool::new(true),
             })
         }
     }
@@ -3114,6 +3144,7 @@ impl Host {
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
+            sent_as,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -3233,13 +3264,36 @@ impl Host {
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let list = self.make_prelude()?;
+        // SAFETY: plain objects of our own.
+        let copy: Option<(ID3D12CommandQueue, Prelude)> = relay_copy_queue()
+            .then(|| unsafe {
+                (|| -> windows::core::Result<(ID3D12CommandQueue, Prelude)> {
+                    let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                        ..Default::default()
+                    })?;
+                    let allocator: ID3D12CommandAllocator =
+                        self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                    let list: ID3D12GraphicsCommandList =
+                        self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                    list.Close()?;
+                    Ok((queue, (allocator, list)))
+                })()
+                .map_err(|e| tracing::warn!(error = %e, "no copy queue for the relay's fetches: they go on the host's queue"))
+                .ok()
+            })
+            .flatten();
+        let (copy, list) = match copy {
+            Some((queue, list)) => (Some(queue), list),
+            None => (None, self.make_prelude()?),
+        };
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
+                copy,
                 fence,
                 event,
                 sent: 0,
@@ -3319,6 +3373,12 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let copy = f.copy.clone();
+        // On a copy queue of its own the fetch runs as soon as it is sent:
+        // the plans' submissions have run, and so every send up to the
+        // latest plan's ([`CardPlan::sent_as`]); later sends may have run
+        // or not, and their ranges are left out of the merge.
+        let landed = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -3332,6 +3392,13 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                if let Some(queue) = &copy {
+                    queue.ExecuteCommandLists(&lists);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    return Ok(landed);
+                }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -4446,7 +4513,42 @@ impl HostList {
 
     /// Only after the list's last submission finished (every one is waited
     /// for).
+    /// A shader that can store to buffers is bound ([`HostList::buffer_writes`]).
+    pub(crate) fn buffers_written(&self) {
+        self.buffer_writes.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a shader that can store to buffers was bound since the last
+    /// call (the caller waits for every earlier shader write now).
+    pub(crate) fn take_buffer_writes(&self) -> bool {
+        let was = self.buffer_writes.swap(false, Ordering::Relaxed);
+        if was {
+            // The caller waits for every earlier shader write.
+            self.shader_writes.store(false, Ordering::Relaxed);
+        }
+        was
+    }
+
+    /// A shader that can write through unordered access is bound
+    /// ([`HostList::shader_writes`]).
+    pub(crate) fn shaders_written(&self) {
+        self.shader_writes.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a shader that can write through unordered access was bound
+    /// since the last wait for every earlier shader write; the caller waits
+    /// now if so (which serves buffer writes too).
+    pub(crate) fn take_shader_writes(&self) -> bool {
+        let was = self.shader_writes.swap(false, Ordering::Relaxed);
+        if was {
+            self.buffer_writes.store(false, Ordering::Relaxed);
+        }
+        was
+    }
+
     pub(crate) fn reset(&self) {
+        self.buffer_writes.store(true, Ordering::Relaxed);
+        self.shader_writes.store(true, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
@@ -5758,6 +5860,11 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            tracing::info!(
+                "the title's barrier groups since the start: {} waited for every earlier shader write, {} left out (no shader that writes through unordered access since the last wait; VICTORY_BARRIER_GROUPS=all waits at all)",
+                crate::list::GROUPS_WAITED.load(Ordering::Relaxed),
+                crate::list::GROUPS_LEFT_OUT.load(Ordering::Relaxed)
+            );
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

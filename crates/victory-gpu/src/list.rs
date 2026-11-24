@@ -1931,6 +1931,18 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Barrier groups left out (no shader that writes through unordered access
+/// since the last wait) and waited at, since the start.
+pub(crate) static GROUPS_LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GROUPS_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `VICTORY_BARRIER_GROUPS=all`: every barrier group waits for every earlier
+/// shader write, as before (run 20261124-1508: 784 such waits a frame).
+fn every_group() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_GROUPS").is_some_and(|v| v == "all"))
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -1949,6 +1961,15 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        // Nothing bound since the last such wait can write through
+        // unordered access: nothing to wait for (`VICTORY_BARRIER_GROUPS=all`
+        // waits at every group, as before). The other parts of a group
+        // (texture layouts) are the host's own transitions.
+        if !list.take_shader_writes() && !every_group() {
+            GROUPS_LEFT_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        GROUPS_WAITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };

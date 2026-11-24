@@ -297,7 +297,8 @@ pub(crate) fn builder_runs() -> bool {
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         // Which ones, and why (each line once: the builder is off from
-        // here on).
+        // here on; diagnostics builds keep the reasons).
+        #[cfg(feature = "diagnostics")]
         for p in b.pipelines.iter() {
             if let Some(why) = make::missing(p) {
                 tracing::warn!(why, "a ray-tracing structure builder program without a host pipeline");

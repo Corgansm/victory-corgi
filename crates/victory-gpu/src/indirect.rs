@@ -252,7 +252,8 @@ pub(crate) fn bound(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let wait = list.take_buffer_writes() || every_wait();
+    record_clamp_with(c, &list.list, &dst, budget, src, count, spec, false, wait).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -272,7 +273,22 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, true).then_some(dst)
+    let wait = list.take_buffer_writes() || every_wait();
+    record_clamp_with(c, &list.list, &dst, budget, src, None, spec, true, wait).then_some(dst)
+}
+
+/// `VICTORY_INDIRECT_WAITS=1`: every clamp waits for every earlier shader
+/// write before it and after it, as it did before (run 20261124-1455: two
+/// such waits around each of some 6,000 clamps a frame, about 140 ms of a
+/// 214 ms frame on the card). By default the wait before a clamp is left
+/// out when no shader that can store to buffers was bound in the list
+/// since the last one (nothing can have written the arguments), and the
+/// wait after it is left out always: the scratch buffer's change of state
+/// to indirect arguments waits for the clamp's writes to it, the only
+/// ones the indirect call reads.
+fn every_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WAITS").is_some_and(|v| v == "1"))
 }
 
 fn record_clamp(
@@ -299,6 +315,23 @@ fn record_clamp_as(
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
     ahead: bool,
+) -> bool {
+    record_clamp_with(c, l, dst, budget, (src, src_offset), count, (kind, stride, records), ahead, true)
+}
+
+/// [`record_clamp_as`]; `wait`: wait for every earlier shader write first
+/// (see [`every_wait`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_with(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    dst: &ID3D12Resource,
+    budget: u64,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+    ahead: bool,
+    wait: bool,
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -372,7 +405,8 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    let skip = usize::from(!waits || !wait);
+    let skip_after = usize::from(!waits || !every_wait());
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -386,7 +420,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_after..]);
     }
     true
 }

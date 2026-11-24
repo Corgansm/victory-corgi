@@ -141,9 +141,28 @@ const WINDOW_MOST: u64 = 64;
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
 /// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
+/// On by default (run 20261124-1457: clamps a frame 5,700-6,000 down to
+/// about 2,550, 3.6 to 4.3 fps in the prison cell); `VICTORY_INDIRECT_WINDOW=0`
+/// clamps every record on its own again.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_none_or(|v| v != "0"))
+}
+
+/// Constant buffer views in descriptor tables are views of the buffer's
+/// host copy when it has one at a 256-byte boundary, not a copy of title
+/// memory filled on the CPU at submission: a fill of memory that a flight
+/// in the air may write settles every flight first (run 20261124-1517: one
+/// such settle a frame, 80 ms of a 185 ms frame waiting for the card). The
+/// copy is refreshed at submission like any range a draw reads, and a range
+/// flights write is left as they wrote it.
+/// shortcut: off by default (`VICTORY_TABLE_CBV_COPY=1` turns it on): with
+/// it the title never left its loading screen (run 20261124-1523: stuck
+/// after the story packs opened, as the timing runs were), so some table
+/// constants change in ways the copy's refresh does not see.
+fn table_constants_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_CBV_COPY").is_some_and(|v| v == "1"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -899,6 +918,20 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            // What it stores may be an indirect call's arguments: the next
+            // clamp waits for it (`crate::indirect`).
+            if t.stores {
+                list.buffers_written();
+            }
+            // What it writes through unordered access, the title's next
+            // barrier group waits for (`crate::list::barrier_groups`).
+            if t.stores
+                || !t.host.root_uavs.is_empty()
+                || !t.host.root_indexed_views.is_empty()
+                || t.used.iter().any(|u| u.kind == ResourceType::Uav)
+            {
+                list.shaders_written();
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -2022,6 +2055,19 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // In a host copy, on a 256-byte boundary: the view is
+                        // of the copy, brought up to date at submission, as
+                        // root constant buffers are (`root_view`).
+                        if size > 0
+                            && table_constants_direct()
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                            && shadow.gpu(address).is_multiple_of(256)
+                            && shadow.left(address) >= u64::from(size.next_multiple_of(256))
+                        {
+                            shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, shadow.gpu(address), size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;
