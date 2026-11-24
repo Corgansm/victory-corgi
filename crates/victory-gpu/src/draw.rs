@@ -1711,6 +1711,22 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        // `VICTORY_BACK_LOG=1`: the builder's dispatches and their root views.
+        #[cfg(feature = "diagnostics")]
+        if crate::shadow::back_log() && crate::pipeline::is_builder(self.pipeline as This) {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 1500 {
+                let views: Vec<String> = self
+                    .roots_ref(true)
+                    .iter()
+                    .filter_map(|r| match r {
+                        Root::View(a) => Some(format!("{a:#x}")),
+                        _ => None,
+                    })
+                    .collect();
+                tracing::info!(target: "backlog", name = ?p.name, x, y, z, ?views, "builder dispatch");
+            }
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);

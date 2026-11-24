@@ -1950,6 +1950,8 @@ impl Shadow {
                 }
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
+                    #[cfg(feature = "diagnostics")]
+                    back_note(start + at, &title[..n], self.start, self.len);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                     written += n;
                 }
@@ -2039,6 +2041,8 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
+        #[cfg(feature = "diagnostics")]
+        back_note(start + at, &title[..n], self.start, self.len);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
@@ -2567,6 +2571,8 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::watch::writing(start + at, n);
+                #[cfg(feature = "diagnostics")]
+                back_note(start + at, &title[..n], self.start, self.len);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
                 written = n;
             }
@@ -2642,6 +2648,8 @@ impl Shadow {
             return 0;
         }
         crate::watch::writing(start + at, n);
+        #[cfg(feature = "diagnostics")]
+        back_note(start + at, &title[..n], self.start, self.len);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
         n
     }
@@ -3183,4 +3191,37 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+/// `VICTORY_BACK_LOG=1` (diagnostics): once the ray-tracing structure
+/// builder runs, each run of GPU bytes put into title memory is logged
+/// (address, length, how many are 0xff, the host copy it came from), and
+/// each builder dispatch with its root views: to find stores that land on
+/// the title's own objects.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn back_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_LOG").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+static BACK_LINES: AtomicU64 = AtomicU64::new(0);
+
+/// [`back_log`]: one run of title memory about to take `bytes` (the GPU's
+/// merged in), with how many of them are 0xff, from the copy of
+/// `[start, start + len)`.
+#[cfg(feature = "diagnostics")]
+fn back_note(address: usize, bytes: &[u8], start: u64, len: u64) {
+    if !back_log() || !crate::pipeline::builder_on() || BACK_LINES.fetch_add(1, Ordering::Relaxed) >= 20000 {
+        return;
+    }
+    let ff = bytes.iter().filter(|&&b| b == 0xff).count();
+    tracing::info!(
+        target: "backlog",
+        address = format_args!("{address:#x}"),
+        len = bytes.len(),
+        ff,
+        buffer = format_args!("{start:#x}+{len:#x}"),
+        "gpu bytes put into title memory"
+    );
 }

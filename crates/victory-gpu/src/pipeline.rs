@@ -316,7 +316,18 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILDER_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// The structure builder has run (diagnostics logging keys on it).
+#[cfg(windows)]
+static BUILDER_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the structure builder has started running this run.
+#[cfg(windows)]
+pub(crate) fn builder_on() -> bool {
+    BUILDER_ON.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
