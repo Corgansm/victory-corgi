@@ -4,7 +4,7 @@
 //! types.
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
-//! The title creates some 60,000 pipelines in its first 20
+//! Grand Theft Auto VI creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
@@ -296,6 +296,13 @@ pub(crate) fn builder_runs() -> bool {
     }
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
+        // Which ones, and why (each line once: the builder is off from
+        // here on).
+        for p in b.pipelines.iter() {
+            if let Some(why) = make::missing(p) {
+                tracing::warn!(why, "a ray-tracing structure builder program without a host pipeline");
+            }
+        }
         b.off = true;
         tracing::warn!(
             missing,
@@ -560,6 +567,14 @@ pub(crate) extern "system" fn create_compute(
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
+    #[cfg(windows)]
+    if !desc.stage.code.is_null() && desc.stage.size != 0 {
+        // SAFETY: the title passes `size` bytes of shader code.
+        let container = unsafe { std::slice::from_raw_parts(desc.stage.code, desc.stage.size) };
+        crate::device::cached_compute::learn(container);
+        #[cfg(feature = "diagnostics")]
+        crate::device::pipeline_dump::compute(container);
+    }
     hand_out(
         copy("compute", &desc.stage).into_iter().collect(),
         #[cfg(windows)]
@@ -702,6 +717,34 @@ pub(crate) fn trim_library() {
     library::trim();
 }
 
+/// The folder of the pipeline library (a folder of the cache), once set.
+#[cfg(windows)]
+pub(crate) fn cache_folder() -> Option<&'static std::path::PathBuf> {
+    library::folder()
+}
+
+/// A compute pipeline made from `container`, as `create_compute` makes one
+/// from a description naming it: for the title's cached compute pipelines
+/// (`crate::device::cached_compute`), answered with the container the
+/// title's fallback used for the same entry.
+#[cfg(windows)]
+pub(crate) fn create_compute_from(
+    this: This,
+    root: This,
+    container: &[u8],
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    let desc = ComputeHead {
+        root,
+        stage: Bytecode {
+            code: container.as_ptr(),
+            size: container.len(),
+        },
+    };
+    create_compute(this, &desc, iid, out)
+}
+
 /// The pipeline library's part of the report when the host device is
 /// removed (`library::removal_note`).
 #[cfg(windows)]
@@ -787,7 +830,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
-    /// The stream layout the title builds (title+0x86f090): root
+    /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
     /// topology, render target and depth formats: 0x2b0 bytes.

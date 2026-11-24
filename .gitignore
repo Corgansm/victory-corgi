@@ -10,6 +10,8 @@
 # Build output
 /target/
 /tests/fixtures/*/target/
+/build*.log
+/diag-run.*
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml

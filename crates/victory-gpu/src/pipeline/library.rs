@@ -62,6 +62,11 @@ pub fn use_pipeline_cache(dir: PathBuf) {
     let _ = DIR.set(dir);
 }
 
+/// The folder set by [`use_pipeline_cache`], if one is.
+pub(crate) fn folder() -> Option<&'static PathBuf> {
+    DIR.get()
+}
+
 /// Host pipelines created, loaded from the library, and title pipelines
 /// started at creation, since the start.
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);

@@ -29,7 +29,7 @@ pub static IID: Iid = guid(
 );
 
 /// The levels the device answers to, as on PC: `ID3D12Device1` to
-/// `ID3D12Device8`, and `ID3D12Device11`, which the title creates
+/// `ID3D12Device8`, and `ID3D12Device11`, which Grand Theft Auto VI creates
 /// its device as. Each level's table is the one before plus its methods.
 const LEVEL_IIDS: [Iid; 9] = [
     guid(
@@ -94,7 +94,7 @@ pub(crate) fn is_device(iid: *const Iid) -> bool {
 }
 
 /// The interface version these layouts were checked against (2.4). Both
-/// Minecraft (March 2022) and the title (April 2026) pass it.
+/// Minecraft (March 2022) and Grand Theft Auto VI (April 2026) pass it.
 pub const CHECKED_VERSION: u32 = 0x0002_0004;
 
 /// Feature level 12_2, what the console hardware supports.
@@ -160,7 +160,7 @@ pub extern "system" fn create(
 /// queues then have the newer layouts (two more methods each; see
 /// `list` and `queue`), although the interface version stays 2.4.
 /// shortcut: the creation interface is the only sign of the newer layouts
-/// we have (the title, April 2026, versus Minecraft, March 2022);
+/// we have (Grand Theft Auto VI, April 2026, versus Minecraft, March 2022);
 /// look for a better one if a title breaks the rule.
 static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -346,7 +346,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+/// Device methods 0x1c8 and 0x218 (`SLOT`). Grand Theft Auto VI calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
@@ -354,15 +354,43 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// fail as they always did, with `out` null, and the first ones log the
 /// description's words and what its first word points at, so that the two
 /// methods can be written.
+///
+/// Both are the title's pipeline caches, not its only way to a pipeline
+/// (title code read 2026-11-24; the interface asked for is
+/// `ID3D12PipelineState`, {765a30f3-f624-4c6f-a828-ace948622445}):
+/// - 0x218 (title+0x2480050, called from title+0x247fd30): looks up a
+///   compute pipeline by its key in a table and makes it from the entry;
+///   when that fails the caller makes the same pipeline at once with
+///   `CreateComputePipelineStateX` (0x1f0) from its own description.
+/// - 0x1c8 (title+0x24774c0, a job queued by title+0x24772f0): makes
+///   pipelines ahead of use on a worker thread and puts each into a table
+///   keyed by a hash of the entry's words 3-7 (it keeps the pointer
+///   shifted right by one bit); an entry that fails is left out of the
+///   table, and the pipeline is made by the usual methods when drawn.
+///
+/// So with both failing nothing goes undrawn (no draw or dispatch is
+/// dropped for want of a pipeline in the 2026-11-24 runs); writing them
+/// would save the title's fallback creations, not add to the picture.
+/// Their descriptions point at small CPU-side blobs laid out back to back
+/// (0x1c-0x184 bytes each) and at shader code in GPU memory (0x180-0x200
+/// bytes), not at shader containers; the blobs' layout is not known.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
-    _: This,
+    this: This,
     desc: *const u8,
-    _iid: *const Iid,
+    iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(not(windows))]
+    let _ = (this, iid);
     use std::sync::atomic::{AtomicU32, Ordering};
+    #[cfg(windows)]
+    if SLOT == 0x218
+        && let Some(hr) = cached_compute::serve(this, desc, iid, out)
+    {
+        return hr;
+    }
     static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
     let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
@@ -396,7 +424,289 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pipeline_dump::call(SLOT, calls, desc);
     E_NOTIMPL
+}
+
+/// Slot 0x218 answered from what the title's own fallback made before.
+///
+/// The title calls 0x218 with a cached compute pipeline's entry (the root
+/// signature, then four ranges: a 0x1c-byte block of shader registers, a
+/// 0x14-byte block, the native code in GPU memory, and a block of
+/// resource records), and when that fails makes the same pipeline at once
+/// through 0x1f0 from an ordinary shader container (title+0x247fd30). The
+/// entry's code is the same program compiled for the cache (its first
+/// instructions match the container's, its register use differs), in a
+/// layout not decoded. So a failed call leaves its key, the BLAKE3 of the
+/// four ranges, on its thread; the container of the compute pipeline the
+/// title makes next on that thread is kept under that key, in memory and
+/// in `cached-compute.bin` beside the pipeline library; and a later call
+/// with a known key gets the pipeline made from that container, which is
+/// the one the fallback would make. The first run with an empty file
+/// learns; the ones after it are answered.
+///
+/// `VICTORY_CACHED_COMPUTE=0` turns it off (every call fails as before).
+#[cfg(windows)]
+pub(crate) mod cached_compute {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::object::{HRESULT, Iid, This};
+
+    /// The file's name in the pipeline library's folder.
+    const FILE: &str = "cached-compute.bin";
+    /// The largest range read for a key.
+    const MAX_RANGE: u64 = 1 << 20;
+    /// The largest container kept.
+    const MAX_CONTAINER: usize = 4 << 20;
+
+    thread_local! {
+        /// The key of this thread's last failed call, until the title's
+        /// next compute pipeline on the thread.
+        static PENDING: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+    }
+
+    /// Calls answered from a kept container, and containers learned.
+    static SERVED: AtomicU64 = AtomicU64::new(0);
+    static LEARNED: AtomicU64 = AtomicU64::new(0);
+
+    fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_CACHED_COMPUTE").is_none_or(|v| v != "0"))
+    }
+
+    /// Containers by key, read from the file on first use.
+    fn kept() -> &'static Mutex<HashMap<[u8; 32], Vec<u8>>> {
+        static KEPT: OnceLock<Mutex<HashMap<[u8; 32], Vec<u8>>>> = OnceLock::new();
+        KEPT.get_or_init(|| {
+            let mut map = HashMap::new();
+            if let Some(path) = path()
+                && let Ok(bytes) = std::fs::read(&path)
+            {
+                // Records: key (32), length (u32), container; a torn last
+                // record (a run that ended while writing) is left out.
+                let mut at = 0;
+                while at + 36 <= bytes.len() {
+                    let key: [u8; 32] = bytes[at..at + 32].try_into().expect("32 bytes");
+                    let len = u32::from_le_bytes(bytes[at + 32..at + 36].try_into().expect("4 bytes")) as usize;
+                    let Some(container) = bytes.get(at + 36..at + 36 + len) else {
+                        break;
+                    };
+                    map.insert(key, container.to_vec());
+                    at += 36 + len;
+                }
+                tracing::info!(pipelines = map.len(), ?path, "cached compute pipelines read");
+            }
+            Mutex::new(map)
+        })
+    }
+
+    fn path() -> Option<std::path::PathBuf> {
+        crate::pipeline::cache_folder().map(|dir| dir.join(FILE))
+    }
+
+    /// The key of the entry at `desc`: the BLAKE3 of its four ranges (word
+    /// pairs 1-2, 3-4, 5-6, 7-8, each address and size), or none if one
+    /// cannot be read.
+    fn key(desc: *const u8) -> Option<[u8; 32]> {
+        let mut words = [0u8; 9 * 8];
+        if desc.is_null() || !crate::host::read_into(desc, &mut words) {
+            return None;
+        }
+        let word = |i: usize| u64::from_le_bytes(words[i * 8..i * 8 + 8].try_into().expect("8 bytes"));
+        let mut hasher = blake3::Hasher::new();
+        for pair in 0..4 {
+            let (at, len) = (word(1 + 2 * pair), word(2 + 2 * pair));
+            if at < 0x10000 || len == 0 || len > MAX_RANGE {
+                return None;
+            }
+            let mut range = vec![0u8; len as usize];
+            if !crate::host::read_into(at as *const u8, &mut range) {
+                return None;
+            }
+            hasher.update(&len.to_le_bytes());
+            hasher.update(&range);
+        }
+        Some(*hasher.finalize().as_bytes())
+    }
+
+    /// A call of 0x218: the pipeline from a kept container (the HRESULT
+    /// of making it), or none, after leaving the key for the fallback.
+    pub(super) fn serve(this: This, desc: *const u8, iid: *const Iid, out: *mut This) -> Option<HRESULT> {
+        if !on() {
+            return None;
+        }
+        let key = key(desc)?;
+        let container = kept().lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        let Some(container) = container else {
+            PENDING.with(|p| p.set(Some(key)));
+            return None;
+        };
+        // SAFETY: the entry's first word is the root signature (read above
+        // with the rest of the words, so mapped).
+        let root = unsafe { desc.cast::<This>().read_unaligned() };
+        let hr = crate::pipeline::create_compute_from(this, root, &container, iid, out);
+        let served = SERVED.fetch_add(1, Ordering::Relaxed) + 1;
+        if served.is_power_of_two() {
+            tracing::info!(served, hr, "cached compute pipelines made from the containers their fallbacks used");
+        }
+        Some(hr)
+    }
+
+    /// The title makes a compute pipeline from `container` on this thread:
+    /// kept under the key of the failed call before it, if one waits.
+    pub(crate) fn learn(container: &[u8]) {
+        let Some(key) = PENDING.with(|p| p.take()) else {
+            return;
+        };
+        if container.len() > MAX_CONTAINER || container.len() < 4 || &container[..4] != b"DXBC" {
+            return;
+        }
+        {
+            let mut kept = kept().lock().unwrap_or_else(|e| e.into_inner());
+            if kept.contains_key(&key) {
+                return;
+            }
+            kept.insert(key, container.to_vec());
+            // Appended under the lock: records never interleave.
+            if let Some(path) = path() {
+                let mut record = Vec::with_capacity(36 + container.len());
+                record.extend_from_slice(&key);
+                record.extend_from_slice(&(container.len() as u32).to_le_bytes());
+                record.extend_from_slice(container);
+                let written = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .and_then(|mut f| f.write_all(&record));
+                if let Err(e) = written {
+                    tracing::warn!(error = %e, ?path, "cached compute pipeline not kept on disk");
+                }
+            }
+        }
+        let learned = LEARNED.fetch_add(1, Ordering::Relaxed) + 1;
+        if learned.is_power_of_two() {
+            tracing::info!(learned, "cached compute pipelines learned from their fallbacks");
+        }
+    }
+}
+
+/// Diagnostics for writing [`unknown_pipeline`]: with
+/// `VICTORY_PIPELINE_DUMP=<folder>` (outside the repository: the files hold
+/// title data), the first [`pipeline_dump::CALLS`] calls of each slot are
+/// saved as `<slot>-<call>.bin`: the description's 32 words, then every
+/// range it names, each as u64 address, u64 size, the bytes. A range is a
+/// word that looks like an address followed by one that looks like a size
+/// (below 1 MiB); a word that looks like an address followed by another
+/// address gets its first 1 KiB. The compute pipeline the title makes next
+/// on the same thread after a failed 0x218 call (its fallback, through
+/// 0x1f0) has its shader container saved beside it as
+/// `0x218-<call>-fallback.dxbc`, so that the two can be compared.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) mod pipeline_dump {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+
+    /// Calls of each slot saved.
+    pub(super) const CALLS: u32 = 48;
+
+    thread_local! {
+        /// The 0x218 call on this thread whose fallback is not saved yet.
+        static PENDING_218: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    fn folder() -> Option<&'static PathBuf> {
+        static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        FOLDER
+            .get_or_init(|| {
+                let dir = PathBuf::from(std::env::var_os("VICTORY_PIPELINE_DUMP")?);
+                match std::fs::create_dir_all(&dir) {
+                    Ok(()) => Some(dir),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "VICTORY_PIPELINE_DUMP: no folder");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// `len` bytes at title address `at`, or none if a page is not there.
+    fn bytes(at: u64, len: usize) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        (at >= 0x10000 && crate::host::read_into(at as *const u8, &mut out)).then_some(out)
+    }
+
+    fn looks_like_address(w: u64) -> bool {
+        (0x10000..0x8000_0000_0000).contains(&w)
+    }
+
+    pub(super) fn call(slot: usize, call: u32, desc: *const u8) {
+        let Some(dir) = folder() else {
+            return;
+        };
+        if call > CALLS {
+            return;
+        }
+        let Some(raw) = bytes(desc as u64, 32 * 8) else {
+            return;
+        };
+        let words: Vec<u64> = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
+            .collect();
+        let mut file = raw.clone();
+        let mut i = 0;
+        while i + 1 < words.len() {
+            let (w, next) = (words[i], words[i + 1]);
+            let range = if looks_like_address(w) && next > 0 && next < 1 << 20 {
+                Some((w, next as usize, 2))
+            } else if looks_like_address(w) {
+                Some((w, 1024, 1))
+            } else {
+                None
+            };
+            match range {
+                Some((at, len, step)) => {
+                    if let Some(data) = bytes(at, len) {
+                        file.extend_from_slice(&at.to_le_bytes());
+                        file.extend_from_slice(&(len as u64).to_le_bytes());
+                        file.extend_from_slice(&data);
+                    }
+                    i += step;
+                }
+                None => i += 1,
+            }
+        }
+        let path = dir.join(format!("{slot:#x}-{call:03}.bin"));
+        if let Err(e) = std::fs::write(&path, file) {
+            tracing::warn!(error = %e, ?path, "pipeline dump not written");
+        }
+        if slot == 0x218 {
+            PENDING_218.with(|p| p.set(Some(call)));
+        }
+    }
+
+    /// A compute pipeline is being made from `container` on this thread:
+    /// saved as the fallback of the 0x218 call before it, if one waits.
+    pub(crate) fn compute(container: &[u8]) {
+        let Some(call) = PENDING_218.with(|p| p.take()) else {
+            return;
+        };
+        let Some(dir) = folder() else {
+            return;
+        };
+        let path = dir.join(format!("0x218-{call:03}-fallback.dxbc"));
+        if let Err(e) = std::fs::write(&path, container) {
+            tracing::warn!(error = %e, ?path, "pipeline dump not written");
+        }
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the
@@ -490,7 +800,7 @@ mod tests {
 
     #[test]
     fn newer_device_levels_are_the_same_device() {
-        // ID3D12Device11, as the title asks for it.
+        // ID3D12Device11, as Grand Theft Auto VI asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
         let mut same = std::ptr::null();
