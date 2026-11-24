@@ -391,6 +391,27 @@ fn card_clock_line(frames: f64, ms: f64) {
     );
 }
 
+/// How many values [`profile_counters`] gives.
+#[cfg(feature = "diagnostics")]
+pub(crate) const PROFILE_COUNTERS: usize = 8;
+
+/// For `crate::profile`: [`SUBMISSION_US`], [`COPY_BACK`] and [`PREPARING`]
+/// as they stand.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn profile_counters() -> Vec<u64> {
+    let r = |a: &std::sync::atomic::AtomicU64| a.load(std::sync::atomic::Ordering::Relaxed);
+    vec![
+        r(&SUBMISSION_US[0]),
+        r(&SUBMISSION_US[1]),
+        r(&COPY_BACK[0]),
+        r(&COPY_BACK[1]),
+        r(&PREPARING[0]),
+        r(&PREPARING[1]),
+        r(&PREPARING[2]),
+        r(&PREPARING[3]),
+    ]
+}
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -5973,7 +5994,13 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // `VICTORY_PROFILE=<dir>`: a row per frame, taken around the
+            // frame lines (which zero the counters it reads).
+            #[cfg(feature = "diagnostics")]
+            crate::profile::frame_begins();
             p.meter.frame(p.hwnd);
+            #[cfg(feature = "diagnostics")]
+            crate::profile::frame_ends();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]

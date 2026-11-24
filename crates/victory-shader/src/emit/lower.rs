@@ -454,6 +454,7 @@ fn need(block: usize) {
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
 fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let settled = if lds_uniform_on() { lds_settled(p) } else { None };
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
         let block = &p.blocks[b];
@@ -477,9 +478,13 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                 }
                 // An LDS read at one address for every lane (a wave's total that an earlier
                 // barrier published, say): one dword, the same in all of them. Not the
-                // cross-lane forms (swizzle, permute, by lane number).
+                // cross-lane forms (swizzle, permute, by lane number). Only where LDS holds
+                // still ([`lds_settled`]): the two host halves of a console wave read it at
+                // different moments, and a write between them would part them.
                 Fields::Ds { addr: Some(a), gds: false, .. }
-                    if name.starts_with("ds_read") && !name.contains("addtid") =>
+                    if name.starts_with("ds_read")
+                        && !name.contains("addtid")
+                        && settled.is_some_and(|from| inst.machine.offset > from) =>
                 {
                     vec![*a]
                 }
@@ -507,6 +512,57 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// `VICTORY_LDS_UNIFORM=0`: an LDS read never counts as the same in every lane
+/// ([`lane_uniform`]). Translations are kept by the executable's hash: clear the shader
+/// cache when changing it.
+fn lds_uniform_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_UNIFORM").is_none_or(|v| v != "0"))
+}
+
+/// The byte offset after which LDS holds still for the rest of the program: the first
+/// `s_barrier` after its last LDS write, with no branch from after it back to it or before it
+/// (a loop over the barrier writes again). Reads past it see what every wave wrote before
+/// it, the same bytes for both host halves of a console wave whenever they read them. Every
+/// offset (0) when nothing writes LDS; None when no such barrier exists.
+/// shortcut: by byte offset, which is program order apart from loops, checked below.
+fn lds_settled(p: &Program) -> Option<usize> {
+    let reads_only = |n: &str| {
+        n.starts_with("ds_read")
+            || n.starts_with("ds_swizzle")
+            || n.starts_with("ds_permute")
+            || n.starts_with("ds_bpermute")
+            || n == "ds_nop"
+    };
+    let mut last_write: Option<usize> = None;
+    let mut barriers = Vec::new();
+    for inst in p.blocks.iter().flat_map(|b| b.insts.iter()) {
+        let (name, at) = (inst.name(), inst.machine.offset);
+        match inst.fields {
+            Fields::Ds { .. } if !reads_only(name) => last_write = Some(last_write.map_or(at, |w| w.max(at))),
+            _ if name == "s_barrier" => barriers.push(at),
+            _ => {}
+        }
+    }
+    let Some(written) = last_write else { return Some(0) };
+    let from = barriers.into_iter().filter(|&b| b > written).min()?;
+    for b in &p.blocks {
+        let end = b.insts.last().map_or(b.offset, |i| i.machine.offset);
+        if end <= from {
+            continue;
+        }
+        let targets = match b.exit {
+            crate::ir::Exit::Jump(t) => vec![t],
+            crate::ir::Exit::Branch { taken, not_taken } => vec![taken, not_taken],
+            _ => Vec::new(),
+        };
+        if targets.iter().any(|&t| p.blocks.get(t).is_some_and(|t| t.offset <= from)) {
+            return None;
+        }
+    }
+    Some(from)
 }
 
 /// What a register value holds, for [`wave_local`].

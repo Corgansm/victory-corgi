@@ -135,6 +135,12 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
 }
 
+/// The counters as they stand, in the order of [`C`] (for `crate::profile`,
+/// which takes differences frame by frame).
+pub(crate) fn counts() -> Vec<u64> {
+    COUNT.iter().map(|a| a.load(Relaxed)).collect()
+}
+
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -275,7 +281,29 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
 /// runtime and of the driver alike (3.5 GB in run 60's gameplay, growing by
 /// some 2 MB a frame, and nothing said whose): this says which part is
 /// ours. Bigger blocks are allocations of their own in the map.
-static OWN: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// Kept in 16 shards on lines of their own, picked by the calling thread's
+/// stack (threads' stacks lie a megabyte or more apart): one pair of
+/// counters for every thread made each allocation of every thread fight
+/// over one cache line (a fifth of the time running in a world frame went
+/// to it, run 20261124-1429). A block made on one thread and released on
+/// another counts up in one shard and down in another; the sums
+/// ([`own_total`], wrapping) are exact.
+static OWN: [Shard; 16] = [const { Shard([const { AtomicU64::new(0) }; 8]) }; 16];
+
+#[repr(align(64))]
+struct Shard([AtomicU64; 8]);
+
+/// The calling thread's shard of [`OWN`].
+fn own_shard() -> &'static [AtomicU64; 8] {
+    let here = 0u8;
+    let at = std::ptr::addr_of!(here) as usize;
+    &OWN[(at >> 20) & 15].0
+}
+
+/// Counter `i` of [`OWN`] over all shards.
+fn own_total(i: usize) -> u64 {
+    OWN.iter().fold(0u64, |sum, shard| sum.wrapping_add(shard.0[i].load(Relaxed)))
+}
 
 /// The class of [`OWN`] a block of `size` bytes counts in.
 fn block_class(size: usize) -> usize {
@@ -289,12 +317,13 @@ fn block_class(size: usize) -> usize {
 
 fn own(size: usize, made: bool) {
     let class = block_class(size);
+    let own = own_shard();
     if made {
-        OWN[class].fetch_add(size as u64, Relaxed);
-        OWN[4 + class].fetch_add(1, Relaxed);
+        own[class].fetch_add(size as u64, Relaxed);
+        own[4 + class].fetch_add(1, Relaxed);
     } else {
-        OWN[class].fetch_sub(size as u64, Relaxed);
-        OWN[4 + class].fetch_sub(1, Relaxed);
+        own[class].fetch_sub(size as u64, Relaxed);
+        own[4 + class].fetch_sub(1, Relaxed);
     }
 }
 
@@ -406,7 +435,7 @@ mod command_tests {
 
 #[cfg(test)]
 mod own_tests {
-    use super::{OWN, block_class};
+    use super::{block_class, own_total};
     use std::sync::atomic::Ordering::Relaxed;
 
     #[test]
@@ -444,10 +473,10 @@ mod own_tests {
     #[test]
     fn a_block_is_counted_while_it_lives() {
         let block = vec![1u8; 8 << 20];
-        assert!(OWN[3].load(Relaxed) >= 8 << 20);
-        assert!(OWN[7].load(Relaxed) >= 1);
+        assert!(own_total(3) >= 8 << 20);
+        assert!(own_total(7) >= 1);
         drop(block);
-        assert!(OWN[7].load(Relaxed) < u64::MAX / 2, "no count below zero");
+        assert!(own_total(7) < u64::MAX / 2, "no count below zero");
     }
 }
 
@@ -784,7 +813,7 @@ fn log_memory() {
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
     let views = crate::descriptor::views_kept();
-    let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
+    let own: Vec<u64> = (0..8).map(own_total).collect();
     tracing::info!(
         "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
