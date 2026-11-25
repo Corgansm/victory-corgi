@@ -2227,7 +2227,7 @@ impl<'a> Lower<'a> {
         let (Some(l), Some(h)) = (self.moved_constant(lo), self.moved_constant(hi)) else {
             return Err(OTHER);
         };
-        let k = f64::from_bits(u64::from(h as u32) << 32 | u64::from(l as u32));
+        let k = f64::from_bits(u64::from(h) << 32 | u64::from(l));
         let kf = k as f32;
         let exact = kf.is_finite()
             && f64::from(kf) == k

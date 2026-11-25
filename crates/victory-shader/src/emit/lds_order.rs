@@ -281,7 +281,7 @@ fn injective(tid: &[i64; 3], threads: [u32; 3], spacing: i64) -> bool {
         if c < covered + spacing.max(1) {
             return false;
         }
-        covered = c * (n - 1) + covered;
+        covered += c * (n - 1);
     }
     true
 }
