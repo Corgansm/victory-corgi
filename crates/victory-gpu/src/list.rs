@@ -1936,11 +1936,14 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 pub(crate) static GROUPS_LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static GROUPS_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `VICTORY_BARRIER_GROUPS=all`: every barrier group waits for every earlier
-/// shader write, as before (run 20261124-1508: 784 such waits a frame).
+/// Every barrier group waits for every earlier shader write (the default).
+/// Leaving groups out when no unordered-access writer ran since the last
+/// wait drew walls, people and faces black (runs 20261124-163244 with
+/// waits, 20261124-164513 without): some write the check does not count.
+/// `VICTORY_BARRIER_GROUPS=skip` brings the leaving out back for testing.
 fn every_group() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_GROUPS").is_some_and(|v| v == "all"))
+    *ON.get_or_init(|| !std::env::var_os("VICTORY_BARRIER_GROUPS").is_some_and(|v| v == "skip"))
 }
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
@@ -1962,7 +1965,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         // Nothing bound since the last such wait can write through
-        // unordered access: nothing to wait for (`VICTORY_BARRIER_GROUPS=all`
+        // unordered access: nothing to wait for, under `VICTORY_BARRIER_GROUPS=skip` (the default
         // waits at every group, as before). The other parts of a group
         // (texture layouts) are the host's own transitions.
         if !list.take_shader_writes() && !every_group() {

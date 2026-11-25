@@ -5863,7 +5863,7 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             tracing::info!(
-                "the title's barrier groups since the start: {} waited for every earlier shader write, {} left out (no shader that writes through unordered access since the last wait; VICTORY_BARRIER_GROUPS=all waits at all)",
+                "the title's barrier groups since the start: {} waited for every earlier shader write, {} left out (no shader that writes through unordered access since the last wait; left out only under VICTORY_BARRIER_GROUPS=skip)",
                 crate::list::GROUPS_WAITED.load(Ordering::Relaxed),
                 crate::list::GROUPS_LEFT_OUT.load(Ordering::Relaxed)
             );
