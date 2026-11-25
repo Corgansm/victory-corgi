@@ -250,14 +250,24 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
+    // (`VICTORY_RGB9E5_TARGET=1`, experiment: R9G9B9E5 (67), which the
+    // console renders to in its Series S mode and no PC card does, stands
+    // in as R11G11B10_FLOAT (26): 32 bits a texel, float colour without
+    // alpha.)
+    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 26)];
+    if format == 67 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_RGB9E5_TARGET").is_some_and(|v| v == "1")) {
+            return format;
+        }
+    }
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 2]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, _)| {
                 let Some(host) = crate::host::host() else {
@@ -279,7 +289,7 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
-                    tracing::info!(format = f, "the host does not render to this format: 8-bit RGBA stands in");
+                    tracing::info!(format = f, "the host does not render to this format: another stands in");
                 }
                 refused
             })
@@ -372,10 +382,11 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 4] =
 /// frame-rate line; and since the start, how often a depth plane's twin
 /// lacked what was written to the plane (not given to it), and how often a
 /// depth plane was used in the list that had written its twin, before the
-/// pass (which runs when the list closes).
+/// pass (which runs when the list closes), and how often the pass ran in
+/// the list ahead of a draw testing against the plane (`plane_ahead`).
 #[cfg(windows)]
-pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 3] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+pub(crate) static PLANES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The colour twin of title texture `this`, if it has one.
 #[cfg(windows)]
@@ -1438,6 +1449,7 @@ pub(crate) fn let_go_idle() {
                 // Under the lock: the next use must not find the staging
                 // state of the texture let go (it says "uploaded").
                 crate::texture::unstage(at as This);
+                crate::texture::unfilled(at);
                 made.take()
             } else {
                 None
@@ -1565,6 +1577,57 @@ impl Drop for HostTexture {
             KINDS[1].fetch_sub(self.bytes, Relaxed);
         }
     }
+}
+
+/// A title texture as the debugger's texture inspector shows it.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) struct DebugTexture {
+    pub(crate) this: usize,
+    pub(crate) address: u64,
+    pub(crate) dimension: u32,
+    pub(crate) size: (u64, u32, u16),
+    pub(crate) mips: u16,
+    pub(crate) format: u32,
+    pub(crate) flags: u32,
+    /// Its host copy, if made.
+    pub(crate) host: Option<std::sync::Arc<HostTexture>>,
+    pub(crate) host_bytes: u64,
+    pub(crate) refused: bool,
+    pub(crate) gone: bool,
+    pub(crate) placed: bool,
+    /// When the host copy was last asked for (`crate::host::moment`).
+    pub(crate) used: u64,
+    /// The title fills it (else the card renders to or writes it).
+    pub(crate) title_fills: bool,
+}
+
+/// Every title texture alive, for the debugger.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn debug_textures() -> Vec<DebugTexture> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let all: Vec<usize> = textures().iter().copied().collect();
+    all.into_iter()
+        .map(|t| {
+            let r = resource(t as This);
+            let host = r.host.made.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|m| m.0.clone());
+            DebugTexture {
+                this: t,
+                address: r.data() as u64,
+                dimension: r.desc.dimension,
+                size: (r.desc.width, r.desc.height, r.desc.depth_or_array_size),
+                mips: r.desc.mip_levels,
+                format: r.desc.format,
+                flags: r.desc.flags,
+                host_bytes: host.as_ref().map_or(0, |h| h.bytes),
+                host,
+                refused: r.host.refused.load(Relaxed),
+                gone: r.host.gone.load(Relaxed),
+                placed: r.host.placed.load(Relaxed),
+                used: r.host.used.load(Relaxed),
+                title_fills: title_fills(t as This),
+            }
+        })
+        .collect()
 }
 
 /// How many textures placed in title memory have a resource of ours

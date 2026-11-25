@@ -225,6 +225,9 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Blocks cut in two by [`Module::split`]: what is added to the end of one, and its
+    /// terminator, go to the block its end moved to.
+    moved: HashMap<usize, usize>,
 }
 
 impl Module {
@@ -387,6 +390,37 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// The block that now holds the end of `block` (itself unless [`Module::split`] cut it).
+    pub fn end_of(&self, mut block: usize) -> usize {
+        while let Some(&b) = self.moved.get(&block) {
+            block = b;
+        }
+        block
+    }
+
+    /// Cuts `block` at its current end: what is added to its end from now on, and its
+    /// terminator (if it has one already), go to a new block, which every phi that names
+    /// `block` as where it came from now names instead. `block` itself branches to `to`,
+    /// which the caller fills and leads to the block returned (`to` must have no phis that
+    /// name `block`). For code that has to loop where it stands (a spin wait).
+    pub fn split(&mut self, block: usize, to: usize) -> usize {
+        let block = self.end_of(block);
+        let rest = self.new_block();
+        self.blocks[rest].term = self.blocks[block].term.take();
+        self.blocks[block].term = Some(Term::Br(to));
+        for inst in &mut self.insts {
+            if let Op::Phi(incoming) = &mut inst.op {
+                for (_, b) in incoming.iter_mut() {
+                    if *b == block {
+                        *b = rest;
+                    }
+                }
+            }
+        }
+        self.moved.insert(block, rest);
+        rest
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,
@@ -408,6 +442,7 @@ impl Module {
         let i = self.insts.len() as u32;
         self.insts.push(Inst { ty, op });
         // Terminators are kept apart, so a block can still grow at its end.
+        let block = self.end_of(block);
         self.blocks[block].body.push(i);
         V::Inst(i)
     }
@@ -490,9 +525,17 @@ impl Module {
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
         let V::Inst(i) = phi else { panic!() };
+        let incoming = incoming.into_iter().map(|(v, b)| (v, self.end_of(b))).collect();
+        self.insts[i as usize].op = Op::Phi(incoming);
+    }
+    /// As [`Module::set_phi`], with the blocks named as they are (an edge from the part of
+    /// a block [`Module::split`] cut, into the code it branches to).
+    pub fn set_phi_exact(&mut self, phi: V, incoming: Vec<(V, usize)>) {
+        let V::Inst(i) = phi else { panic!() };
         self.insts[i as usize].op = Op::Phi(incoming);
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
+        let block = self.end_of(block);
         self.blocks[block].term = Some(t);
     }
 

@@ -10,7 +10,7 @@
 //!
 //! When a count buffer is given, threads at or past `min(max, count)` return
 //! immediately without charging the list's budget or reading uninitialized
-//! tail slots. Each list has a budget (2^27 vertex instances or threads,
+//! tail slots. Each list has a budget (2^31 vertex instances or threads,
 //! groups counted as 64 threads, mesh groups as 128): active records past it
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
@@ -36,7 +36,12 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bits 8-15: dispatches, host
+    // thread groups per console thread group along z (a console group of
+    // several waves run as one host group per wave; 0 or 1: as asked).
+    // Bit 16: mesh records as rows (`USER_MESH_ROW`): each written as 20
+    // bytes, the row width and last group (the root constants the mesh
+    // shader reads), then the groups as rows of at most 65,535.
     uint has_count;
     uint count_offset;
 };
@@ -46,7 +51,11 @@ RWByteAddressBuffer dst_args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 27;
+// 2^27 emptied the rest of one to four lists a second in the world (run
+// 20261124-194642): the indirect draws of walls and of clothing after the
+// point where it ran out drew nothing. Records are bounded one by one to
+// 2^26 each, so 2^31 is the most the sum can reach without wrapping.
+static const uint BUDGET = 1u << 31;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
@@ -58,8 +67,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
     if (id.x >= eff_count) return;
+    bool rows = (has_count & (1u << 16)) != 0;
     uint src_at = args_offset + id.x * stride;
-    uint dst_at = id.x * stride;
+    uint dst_at = id.x * (rows ? 20u : stride);
+    uint2 row_words = uint2(0, 0);
     uint cost;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
@@ -79,15 +90,32 @@ void main(uint3 id : SV_DispatchThreadID) {
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
+        // One host group per console wave of a group split by the
+        // translation: z counts the waves too.
+        uint split = max((has_count >> 8) & 0xffu, 1u);
+        if (g.z * split > 65535u) {
+            g = uint3(0, 0, 0);
+        }
+        g.z *= split;
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
+        // Diagnostics: records asking for more groups than a dispatch runs
+        // (65,535) yet under 2^24 (not a slot of all ones), counted in the
+        // budget buffer's word 4, the largest of them in word 5.
+        if (g.x > 65535u && g.x < (1u << 24)) {
+            uint seen;
+            budget.InterlockedAdd(16, 1u, seen);
+            budget.InterlockedMax(20, g.x, seen);
+        }
         // Ahead of its draw, a record over the most a dispatch runs is a
         // slot the title has not filled (Grand Theft Auto VI leaves all
         // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
+        // (As rows, a record runs up to the 2^22 groups of a host dispatch:
+        // past that it is such a slot.)
+        if (ahead && g.x > (rows ? (1u << 22) : 65535u)) {
             g = uint3(0, 0, 0);
         }
         // Diagnostics, in the budget buffer's next words: the largest
@@ -95,12 +123,24 @@ void main(uint3 id : SV_DispatchThreadID) {
         uint was;
         budget.InterlockedMax(4, g.x, was);
         budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
-        groups = g;
+        if (rows && g.x > 65535u && g.x <= (1u << 22) && g.y != 0 && g.z != 0) {
+            // as `crate::draw::mesh_rows`: the fewest rows, as even as they go
+            uint n = (g.x + 65534u) / 65535u;
+            uint width = (g.x + n - 1u) / n;
+            row_words = uint2(width, g.x - 1u);
+            cost = g.x * 128u;
+            groups = uint3(width, n, 1u);
+        } else {
+            g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+            cost = g.x * g.y * g.z * 128u;
+            groups = g;
+        }
     }
     bool over = false;
     if (cost > 0) {
+        // Diagnostics: the largest single record's cost.
+        uint largest;
+        budget.InterlockedMax(12, cost, largest);
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
@@ -124,14 +164,44 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         if (over) {
             groups = uint3(0, 0, 0);
+            row_words = uint2(0, 0);
         }
-        dst_args.Store3(dst_at, groups);
-        for (uint off = 12; off < stride; off += 4) {
-            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        if (rows) {
+            dst_args.Store2(dst_at, row_words);
+            dst_args.Store3(dst_at + 8, groups);
+        } else {
+            dst_args.Store3(dst_at, groups);
+            for (uint off = 12; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+            }
         }
     }
 }
 "#;
+
+/// A mesh dispatch's `kind` bit for [`bound`]: its records are clamped as rows
+/// (`victory_shader::emit::USER_MESH_ROW`), each [`ROW_STRIDE`] bytes in the scratch
+/// buffer: the mesh shader's two root constants, then the groups.
+pub(crate) const ROWS: u32 = 1 << 16;
+/// See [`ROWS`].
+pub(crate) const ROW_STRIDE: u32 = 20;
+
+/// The scratch bytes of `records` clamped records `stride` bytes apart in the title's
+/// buffer ([`ROWS`]: [`ROW_STRIDE`] apart in the scratch buffer).
+fn scratch_bytes(kind: u32, stride: u32, records: u32) -> u64 {
+    let step = if kind & ROWS != 0 { ROW_STRIDE } else { stride };
+    u64::from(step) * u64::from(records)
+}
+
+/// A dispatch's `kind` for [`bound`] with `split` host thread groups per console thread
+/// group (`HostShader::group_split`): the clamp multiplies each record's z by it.
+pub(crate) fn with_split(kind: u32, split: u32) -> u32 {
+    kind | (split.clamp(1, 255) << 8)
+}
+
+/// The clamp shader's `BUDGET`: work (vertex instances, threads) a list's
+/// indirect calls may ask for in all before the rest run empty.
+pub(crate) const BUDGET: u32 = 1 << 31;
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -213,7 +283,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 
 /// Minimum record byte stride for a supported PC indirect argument `kind`.
 fn min_stride(kind: u32) -> Option<u32> {
-    match kind {
+    match kind & 0xff {
         0 => Some(16),
         1 => Some(20),
         2 | 10 => Some(12),
@@ -221,8 +291,33 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
+/// Parses `VICTORY_INDIRECT_CLAMP`: enabled by default; explicit `"0"`,
+/// `"false"`, `"no"`, or `"off"` (ASCII case-insensitive) bypasses the
+/// argument-clamp compute pass so `ExecuteIndirect` reads the title's
+/// argument buffer directly.
+pub(crate) fn parse_clamp_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return true;
+    };
+    let Some(text) = value.to_str() else {
+        return true;
+    };
+    let trimmed = text.trim();
+    !(trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off"))
+}
+
+/// Whether indirect arguments are copied and clamped by our compute shader
+/// before `ExecuteIndirect` (`VICTORY_INDIRECT_CLAMP=0` disables it).
+pub(crate) fn clamp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_clamp_enabled(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
+}
+
 /// Validates record alignment and returns the scratch byte size `stride * records`.
-fn validate_layout(
+pub(crate) fn validate_layout(
     (kind, stride, records): (u32, u32, u32),
     src_offset: u64,
     count_offset: Option<u64>,
@@ -250,10 +345,19 @@ pub(crate) fn bound(
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    validate_layout(spec, src.1, count.map(|(_, off)| off))?;
+    let bytes = scratch_bytes(spec.0, spec.1, spec.2);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = list.take_buffer_writes() || every_wait();
     record_clamp_with(c, &list.list, &dst, budget, src, count, spec, false, wait).then_some(dst)
+}
+
+/// Ensures earlier compute writes to indirect argument/count buffers are
+/// visible before a direct (unclamped) `ExecuteIndirect`, without running
+/// the clamp compute shader or invalidating compute pipeline state.
+pub(crate) fn wait_direct(list: &HostList) {
+    // SAFETY: an open command list; global UAV barrier has no resource hazards.
+    unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -271,7 +375,8 @@ pub(crate) fn bound_ahead(
     src: (&ID3D12Resource, u64),
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
-    let bytes = validate_layout(spec, src.1, None)?;
+    validate_layout(spec, src.1, None)?;
+    let bytes = scratch_bytes(spec.0, spec.1, spec.2);
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     let wait = list.take_buffer_writes() || every_wait();
     record_clamp_with(c, &list.list, &dst, budget, src, None, spec, true, wait).then_some(dst)
@@ -376,7 +481,11 @@ fn record_clamp_with(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    // `kind` bits 8-15: the dispatch's host groups per console group ([`with_split`]);
+    // bit 16: mesh records as rows ([`ROWS`])
+    let (kind, split, rows) = (kind & 0xff, (kind >> 8) & 0xff, (kind >> 16) & 1);
+    let flags = has_count | (u32::from(ahead) << 1) | (split << 8) | (rows << 16);
+    let constants = [kind, stride, records, args_offset, flags, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -405,7 +514,14 @@ fn record_clamp_with(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
+    // `VICTORY_CLAMP_WAIT=auto` (experiment): the caller says whether a
+    // shader may have written since the last such wait ([`needs_wait`]).
+    let waits = waits && NEEDS_WAIT.get();
     let skip = usize::from(!waits || !wait);
+    #[cfg(feature = "diagnostics")]
+    if skip == 0 {
+        crate::copystat::add(crate::copystat::C::IndirectWaited, 1);
+    }
     let skip_after = usize::from(!waits || !every_wait());
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
@@ -724,7 +840,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -752,6 +868,28 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Every lane's slice is hashed: first byte of piece 0 (lane 0),
+        // last byte of piece 2 (lane 63), and swapping two 16-byte blocks
+        // across lanes in piece 1 must all be detected.
+        for &(offset, expected) in &[
+            (0usize, [1, 0, 0]),
+            (PIECE * 3 - 1, [0, 0, 1]),
+            (63 * 16 + 7, [1, 0, 0]),
+        ] {
+            // SAFETY: offset is inside the mapped buffer.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset] ^ 0x01) };
+            assert_eq!(run(&mut warp, 1), expected);
+            // SAFETY: restore original byte.
+            unsafe { now_ptr.add(offset).write_volatile(content[offset]) };
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
+        // Swap lane 0's first 16 bytes with lane 1's first 16 bytes in piece 1.
+        // SAFETY: both 16-byte blocks are inside piece 1 of the mapped buffer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(content[PIECE + 16..PIECE + 32].as_ptr(), now_ptr.add(PIECE), 16);
+            std::ptr::copy_nonoverlapping(content[PIECE..PIECE + 16].as_ptr(), now_ptr.add(PIECE + 16), 16);
+        }
+        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
@@ -1091,7 +1229,7 @@ void main() {
         const KIND_INDEXED: u32 = 1;
         const STRIDE: u32 = 24; // 5 indexed-draw words + 1 trailing custom word
         const RECORDS: u32 = 128; // 2 waves of 64: old InterlockedAdd wrapped 2^32 at 64!
-        const BUDGET_CAP: u32 = 1 << 27;
+        const BUDGET_CAP: u32 = BUDGET;
 
         let total_bytes = (STRIDE * RECORDS) as usize;
         let (src_buf, src_ptr, _) = warp.shared_buffer(total_bytes as u64);
@@ -1183,7 +1321,9 @@ void main() {
             assert_eq!(rec[4], 5000 + i as u32);
             assert_eq!(rec[5], 0xCAFE_0000 | (i as u32));
         }
-        assert_eq!((kept, zeroed), (2, (RECORDS as usize) - 2));
+        // Each record costs 2^26: the budget keeps BUDGET >> 26 of them.
+        let fit = (BUDGET >> 26) as usize;
+        assert_eq!((kept, zeroed), (fit, (RECORDS as usize) - fit));
     }
 
     /// Exercises `HostList::indirect_scratch`, `bound`, `done`, `Host::execute`,
@@ -1247,4 +1387,50 @@ void main() {
         host.execute(&[&list]);
         list.reset();
     }
+
+    #[test]
+    fn parse_clamp_enabled_defaults_on_and_respects_explicit_disable() {
+        use std::ffi::OsStr;
+        assert!(parse_clamp_enabled(None));
+        for on in ["", "1", " 1 ", "true", "TRUE", "yes", "on"] {
+            assert!(
+                parse_clamp_enabled(Some(OsStr::new(on))),
+                "{on:?} must keep indirect clamp enabled"
+            );
+        }
+        for off in ["0", " 0 ", "false", "FALSE", "no", "NO", "off", "OFF"] {
+            assert!(
+                !parse_clamp_enabled(Some(OsStr::new(off))),
+                "{off:?} must disable indirect clamp"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_layout_rejects_misaligned_or_overflowing_direct_arguments() {
+        assert_eq!(validate_layout((0, 16, 4), 0, None), Some(64));
+        assert_eq!(validate_layout((10, 12, 8), 16, Some(4)), Some(96));
+        assert_eq!(validate_layout((0, 12, 1), 0, None), None);
+        assert_eq!(validate_layout((0, 16, 1), 2, None), None);
+        assert_eq!(validate_layout((0, 16, 1), 0, Some(2)), None);
+        assert_eq!(validate_layout((0, 16, u32::MAX), 0, None), None);
+    }
+}
+
+thread_local! {
+    /// Whether the next clamp waits for earlier shader writes (`true`
+    /// unless the recording thread said otherwise for this one).
+    static NEEDS_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Says whether the clamps this thread records from here on wait for
+/// every earlier shader write before and after their pass.
+pub(crate) fn needs_wait(needed: bool) {
+    NEEDS_WAIT.set(needed);
+}
+
+/// `VICTORY_CLAMP_WAIT=auto`.
+pub(crate) fn wait_auto() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_WAIT").is_some_and(|v| v == "auto"))
 }

@@ -69,6 +69,35 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a pair of user-data dwords the host sets per
+/// mesh dispatch (the first, then the next index): the row width of a mesh
+/// dispatch of more than 65,535 groups the host runs as rows of that many
+/// (`x` by `y`), and the last group the console asked for. The console's
+/// mesh dispatches are one-dimensional and may ask for more groups than a
+/// host dimension holds (Grand Theft Auto VI's meshlet lists: up to 112,665).
+/// A row width of 0: the dispatch is the console's, one row. The groups of
+/// the last row past the count run as the last group (the same meshlet drawn
+/// again: no new pixels).
+pub const USER_MESH_ROW: u32 = 0x104;
+/// The root UAV a traced shader writes its trace to (`lower::with_trace`): word 0
+/// counts the records (a ring); records of [`TRACE_WORDS`] dwords follow from byte
+/// [`TRACE_FIRST`] on.
+pub const SLOT_TRACE: u8 = 252;
+/// `RootType::Other` codes of the user-data dwords a traced shader reads: what it
+/// traces ([`TRACE_PIXEL`] or [`TRACE_THREAD`], 0 nothing), then x, y and z of the
+/// pixel or the thread, the stamp each record carries (the frame), the tag (the draw),
+/// and the ring's capacity in records.
+pub const USER_TRACE: u32 = 0x110;
+/// See [`USER_TRACE`]: the pixel at x, y (pixel shaders).
+pub const TRACE_PIXEL: u32 = 1;
+/// See [`USER_TRACE`]: the thread whose group id times the group size plus its id in the
+/// group is x, y, z (compute shaders).
+pub const TRACE_THREAD: u32 = 2;
+/// Byte offset of the first trace record.
+pub const TRACE_FIRST: u32 = 64;
+/// Dwords of a trace record: stamp, tag, console code offset, register (bit 16 set: a
+/// VGPR; else an SGPR), value, the order the shader ran it in, then 2 zeros.
+pub const TRACE_WORDS: u32 = 8;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -713,7 +742,7 @@ impl Shader {
                         mesh.max_vertices,
                         mesh.max_primitives,
                         mesh.topology.into(),
-                        0,
+                        super::mesh_payload(),
                     ]
                     .map(|n| Some(i32c(&mut self, n)));
                     let mut node = vec![Some(t)];

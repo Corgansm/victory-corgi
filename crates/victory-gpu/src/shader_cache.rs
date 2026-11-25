@@ -43,7 +43,19 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        // `VICTORY_SHADER_CACHE_KEY=<name>`: the name stands for the
+        // executable, so builds that differ outside the translator share
+        // one cache (a new executable otherwise translates every shader
+        // again, minutes of a world's first frames). Whoever sets it
+        // changes the name when the translation changes: nothing here can
+        // tell.
+        let exe = match std::env::var("VICTORY_SHADER_CACHE_KEY") {
+            Ok(name) if !name.trim().is_empty() => {
+                tracing::warn!(name = name.trim(), "VICTORY_SHADER_CACHE_KEY: the shader cache is keyed by this name, not by the executable");
+                Ok(format!("VICTORY_SHADER_CACHE_KEY={}", name.trim()).into_bytes())
+            }
+            _ => std::env::current_exe().and_then(std::fs::read),
+        };
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
@@ -65,6 +77,12 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
                     "VICTORY_F16_NEAREST",
+                    "VICTORY_LDS_UNIFORM",
+                    "VICTORY_WAVE_LOOSE_LDS",
+                    "VICTORY_WAVE_LOCAL",
+                    "VICTORY_GROUP_SPLIT",
+                    "VICTORY_WAVE_UNION_LOOPS",
+                    "VICTORY_PAIR_SYNC",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
                     bytes.push(b'=');
@@ -153,7 +171,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -244,6 +262,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.group_split);
     out
 }
 
@@ -312,6 +331,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let group_split = r.word().filter(|&n| (1..=16).contains(&n))?;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -322,6 +342,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        group_split,
     })
 }
 
@@ -356,6 +377,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            group_split: 1,
         }
     }
 

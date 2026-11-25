@@ -178,6 +178,9 @@ pub struct Export {
     pub compressed: bool,
     /// The program's last export (for pixels: kills the lanes not in EXEC).
     pub done: bool,
+    /// A pixel export's valid mask: EXEC here says which pixels are written (`vm`); one
+    /// without leaves the last such mask as it was.
+    pub vm: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -421,7 +424,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                     src,
                     compr,
                     done,
-                    ..
+                    vm,
                 } => {
                     let target = match *target {
                         t @ 0..=7 => Target::Color(t),
@@ -454,6 +457,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         values,
                         compressed: *compr,
                         done: *done,
+                        vm: *vm,
                     });
                 }
                 _ => {}

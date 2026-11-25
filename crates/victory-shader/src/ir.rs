@@ -386,10 +386,25 @@ fn unspill(
                     codes.push(c);
                 }
             }
+            // M0-relative access names every VGPR from its base up (`effects`), but it
+            // reads the register array the compiler indexes, which never holds its
+            // SGPR spill VGPR (allocated apart, at the top): only its own operands
+            // count here. (GTA VI's 7f05ddab771799a9: `v_movrels_b32 v36, v67` kept
+            // v144, its spill VGPR, from being taken apart, and the lane masks parked
+            // there then stopped the program as "a lane mask holding lanes elsewhere
+            // read as data".)
+            let relative = name.starts_with("v_movrel") || name == "v_swaprel_b32";
+            let named = |r: u8| match &fields {
+                Fields::Valu(v) => v.dst.iter().chain(&v.src).any(|o| {
+                    matches!(*o, Operand::Vector { reg, dwords } if r >= reg && r < reg.saturating_add(dwords))
+                }),
+                _ => true,
+            };
             for reg in reads.into_iter().chain(writes) {
                 match reg {
                     Reg::S(c) => used[usize::from(c)] = true,
                     Reg::V(r) if park.is_some_and(|p| p.1 == r) => stores[usize::from(r)] = true,
+                    Reg::V(r) if relative && !named(r) => {}
                     Reg::V(r) => other[usize::from(r)] = true,
                     Reg::Scc => {}
                 }

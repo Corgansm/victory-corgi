@@ -127,6 +127,9 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Of those, the ones that waited before their dispatch (a shader that can store to
+    /// buffers was bound in the list since the last such wait).
+    IndirectWaited,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -191,6 +194,15 @@ pub(crate) fn command_took(op: &str, ms: f64) {
     e.0 += 1;
     e.1 += us;
     e.2 = e.2.max(us);
+    // And by what the command draws into: the sizes and formats of its
+    // targets and depth texture (the addresses left out).
+    if let (Some(a), Some(b)) = (op.find(" targets ["), op.find(" state [")) && a < b {
+        let sizes: Vec<&str> = op[a..b].split(' ').filter(|w| !w.starts_with("0x") && !w.starts_with("[\"0x") && !w.starts_with("Some(\"0x")).collect();
+        let e = by.as_mut().unwrap().entry(format!("(into){}", sizes.join(" "))).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += us;
+        e.2 = e.2.max(us);
+    }
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -977,6 +989,67 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
+/// List-call time by the line of `list.rs` that made the call: nanoseconds
+/// and calls since the last frame line (experiment).
+static BY_LINE: Mutex<Option<HashMap<u32, (u64, u64)>>> = Mutex::new(None);
+/// Frames presented since the last such line.
+pub(crate) static BY_LINE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static LINES: std::cell::RefCell<(HashMap<u32, (u64, u64)>, u32)> = std::cell::RefCell::new((HashMap::new(), 0));
+}
+
+/// A list call made at `line` of `list.rs` that began at `started` has
+/// returned.
+pub(crate) fn recorded_at(line: u32, started: std::time::Instant) {
+    let ns = started.elapsed().as_nanos() as u64;
+    LINES.with_borrow_mut(|(lines, pending)| {
+        let e = lines.entry(line).or_insert((0, 0));
+        e.0 += ns;
+        e.1 += 1;
+        *pending += 1;
+        if *pending >= 512 {
+            *pending = 0;
+            let mut all = BY_LINE.lock().unwrap_or_else(|e| e.into_inner());
+            let all = all.get_or_insert_with(HashMap::new);
+            for (line, (ns, calls)) in lines.drain() {
+                let e = all.entry(line).or_insert((0, 0));
+                e.0 += ns;
+                e.1 += calls;
+            }
+        }
+    });
+}
+
+/// A part of a list call, timed while it lives (experiment): summed with
+/// the calling lines under `id`, which [`by_line_say`] prints as `part <id>`.
+pub(crate) struct Sect(u32, std::time::Instant);
+
+pub(crate) fn sect(id: u32) -> Sect {
+    Sect(1_000_000 + id, std::time::Instant::now())
+}
+
+impl Drop for Sect {
+    fn drop(&mut self) {
+        recorded_at(self.0, self.1);
+    }
+}
+
+/// The frame line's neighbour: list-call time by calling line.
+pub(crate) fn by_line_say(frames: f64) {
+    let Some(all) = BY_LINE.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut rows: Vec<(u32, u64, u64)> = all.into_iter().map(|(l, (ns, n))| (l, ns, n)).collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+    let text: Vec<String> = rows
+        .iter()
+        .take(26)
+        .map(|&(line, ns, n)| format!("{}{} {:.1} ms in {:.0} ({:.1} us each)", if line >= 1_000_000 { "part " } else { "list.rs:" }, line % 1_000_000, ns as f64 / 1e6 / frames, n as f64 / frames, ns as f64 / 1e3 / n.max(1) as f64))
+        .collect();
+    tracing::info!("  list calls by calling line, per frame, all threads: {}", text.join("; "));
+}
+
 /// A list call on this thread that began at `started` has returned.
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
@@ -1264,11 +1337,12 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours each), {:.0} \
+         of them after such a wait; barrier experiment {}",
         c[C::WaitsForGroups as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
+        c[C::IndirectWaited as usize],
         barrier_test()
     );
     // What is compared after submissions, largest first, and how much of
@@ -1311,6 +1385,7 @@ pub(crate) fn log(frames: f64) {
         .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    by_line_say(BY_LINE_FRAMES.swap(0, Relaxed).max(1) as f64);
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

@@ -37,7 +37,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -284,7 +283,7 @@ struct Views {
 /// How long a view in `Views::by_section` can be (see `Views::long`).
 const SHORT: usize = 2 << 20;
 
-static VIEWS: Mutex<Views> = Mutex::new(Views {
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     views: BTreeMap::new(),
     sections: Vec::new(),
     by_section: BTreeMap::new(),
@@ -350,8 +349,8 @@ pub(crate) fn aliases(at: usize, len: usize) -> (Vec<(usize, usize)>, bool) {
     (found, more)
 }
 
-fn views() -> std::sync::MutexGuard<'static, Views> {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+fn views() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
@@ -434,7 +433,7 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
-    cover_in(&views().views, at, len)
+    cover_in(&VIEWS.read().unwrap_or_else(|e| e.into_inner()).views, at, len)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and

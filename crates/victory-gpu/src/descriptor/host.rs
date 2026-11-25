@@ -26,11 +26,19 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// `made`, readable without its lock: what each slot was last made
+    /// from once the making is done (0 while it is not). A draw's tables
+    /// ask for every slot they name at every draw, and five recording
+    /// threads stood in line for `made` to hear "unchanged" (a third of
+    /// their time in list calls blocked on it, sampled in a cutscene).
+    fast: Vec<std::sync::atomic::AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// (In `KEPT_SHARDS` parts by slot number, each under a lock of its
+    /// own: five recording threads make slots at once.)
+    kept: Vec<Mutex<std::collections::HashMap<u32, ID3D12Resource>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -237,12 +245,40 @@ pub(crate) fn remapped(at: usize, len: usize) {
         return;
     }
     if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+        // No pass runs (no shader that picks textures by index is bound: a
+        // loading screen). Cleared here, as they were, the slots of every
+        // texture streamed into the place of another in the meantime went
+        // on showing the old one (98,304 ranges dropped in each run of
+        // 20261124, all while the world loaded): joined instead into fewer,
+        // wider ranges, which make a few more slots due than need be.
+        let before = ranges.len();
+        coarsen(&mut ranges, MOST / 2);
+        STALE[2].fetch_add((before - ranges.len()) as u64, Relaxed);
     }
     ranges.push((start, end));
+}
+
+/// Joins `ranges` until at most `most` are left: first the ones that
+/// overlap or touch, then those with the smallest gaps between them, by
+/// gaps of 64 KiB, then 128 KiB, and so on. What the joined ranges cover
+/// takes in all that the ranges did.
+fn coarsen(ranges: &mut Vec<(u64, u64)>, most: usize) {
+    ranges.sort_unstable();
+    let mut gap = 0u64;
+    loop {
+        let mut joined: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for &(start, end) in ranges.iter() {
+            match joined.last_mut() {
+                Some(last) if start <= last.1.saturating_add(gap) => last.1 = last.1.max(end),
+                _ => joined.push((start, end)),
+            }
+        }
+        *ranges = joined;
+        if ranges.len() <= most.max(1) || gap >= 1 << 40 {
+            return;
+        }
+        gap = if gap == 0 { 64 << 10 } else { gap * 2 };
+    }
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -320,26 +356,39 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
-    /// - then the others, the newest write first and the oldest next, in
-    ///   turns: slot order served the low slots of a backlog of
+    /// - first the ones looked at before whose memory was not there: the
+    ///   look is a query and costs no upload, and memory that has arrived
+    ///   since is what the title streamed in last;
+    /// - then the ones never uploaded, the newest write first and the oldest
+    ///   next, in turns: slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
-    ///   first 3D frames).
+    ///   first 3D frames);
+    /// - last the ones uploaded in part, newest first: they show something
+    ///   already, and served ahead of the rest (as they were) their
+    ///   uploads of more mips took the frame's bytes while slots with
+    ///   nothing at all waited, the oldest of them 1,615 frames (run
+    ///   20261124-184104, every frame at the byte limit).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
+        let mut looked: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        let mut partial: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.mapped > 0 {
+                &mut partial
+            } else if w.looks > 0 {
+                &mut looked
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
+        looked.sort_unstable_by(newest_first);
         fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        partial.sort_unstable_by(newest_first);
+        let mut order: Vec<(u32, u64)> = looked.iter().map(|&(_, index, write)| (index, write)).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -349,6 +398,7 @@ impl TextureQueue {
                 order.push((fresh[old].1, fresh[old].2));
             }
         }
+        order.extend(partial.iter().map(|&(_, index, write)| (index, write)));
         order.truncate(max);
         order
     }
@@ -379,6 +429,15 @@ impl TextureQueue {
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
         if let Some(w) = self.same(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
+        }
+    }
+
+    /// None of slot `index`'s memory is mapped now (streamed out): what was
+    /// mapped at its last upload says nothing of what arrives there next,
+    /// which is uploaded as soon as some of it is.
+    fn unmapped(&mut self, index: u32, write: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.mapped = 0;
         }
     }
 
@@ -553,6 +612,16 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The parts `HostHeap::kept` is in.
+const KEPT_SHARDS: usize = 1024;
+
+/// Whether a slot made from the record the title still has is answered
+/// without the heap's lock (`HostHeap::fast`); `VICTORY_MIRROR_FAST=0`: no.
+fn mirror_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_FAST").is_none_or(|v| v != "0"))
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -627,7 +696,8 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            fast: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            kept: (0..KEPT_SHARDS).map(|_| Mutex::new(std::collections::HashMap::new())).collect(),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -814,6 +884,12 @@ impl HostHeap {
         textures.later(index, write, frame, most);
     }
 
+    /// None of title slot `index`'s memory is mapped now
+    /// ([`TextureQueue::unmapped`]).
+    pub(crate) fn texture_slot_unmapped(&self, index: u32, write: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).unmapped(index, write);
+    }
+
     /// Bytes of title slot `index`'s memory that were mapped when it was
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
@@ -871,6 +947,7 @@ impl HostHeap {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
+        self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
         if key == 0 {
             return;
         }
@@ -1099,13 +1176,23 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
-            }
+        let mut kept = self.kept[index as usize % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
+        // The resource the slot keeps already (a slot made again from
+        // another view of it, at every draw for some): nothing to let go.
+        if let (Some(new), Some(old)) = (&resource, kept.get(&index))
+            && windows::core::Interface::as_raw(new) == windows::core::Interface::as_raw(old)
+        {
+            return;
+        }
+        let old = match resource {
+            Some(resource) => kept.insert(index, resource),
+            None => kept.remove(&index),
+        };
+        drop(kept);
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = old {
+            crate::host::retire(old);
         }
     }
 
@@ -1257,6 +1344,12 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Made from this very record already: nothing to do, and nothing
+        // to wait for (`fast`; `VICTORY_MIRROR_FAST=0` takes the lock, as
+        // before).
+        if tag == VIEW_TAG && key != 0 && mirror_fast() && self.fast[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
+            return view_at(i, generation);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -1264,6 +1357,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1305,7 +1399,32 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
+            self.fast[index as usize].store(0, std::sync::atomic::Ordering::Release);
+            // A view the title writes of a texture it fills whose host copy
+            // holds nothing yet (made now, or let go and made again): made
+            // from it, the slot read zeros, alpha too, until a draw or the
+            // texture pass uploaded it, and alpha-tested materials vanished
+            // meanwhile. It shows the neutral texture ([`fallback_on`])
+            // until one of those makes it, as they make a slot left for
+            // later.
+            if !later
+                && !for_draw
+                && !self.sampler
+                && let Some(words) = empty_texture_view(&view)
+                && fallback_view(&words, self.cpu(index))
+            {
+                made[index as usize] = 0;
+                self.keep(index, None);
+                EMPTY_AT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Some(view);
+            }
             made[index as usize] = if later { 0 } else { key };
+            // The making itself without the heap's lock: it may make a host
+            // copy of what the view shows, milliseconds of the host's own
+            // waiting, with every other recording thread in line behind it.
+            // shortcut: two threads making one slot at once (the title
+            // writing a slot two of its lists read) is not kept apart.
+            drop(made);
             let kept = if later {
                 None
             } else {
@@ -1315,6 +1434,10 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            // Made: from here on without the lock.
+            if !later {
+                self.fast[index as usize].store(key, std::sync::atomic::Ordering::Release);
+            }
         }
         Some(view)
     }
@@ -1324,8 +1447,8 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
+        let kept = self.kept[index as usize % KEPT_SHARDS].lock().unwrap_or_else(|e| e.into_inner());
+        let shown = kept.get(&index)?;
         Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
     }
 
@@ -2002,6 +2125,37 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     }
 }
 
+/// Slots the title wrote with a view of a texture whose host copy held
+/// nothing yet, shown the neutral texture until made, since the start.
+pub(crate) static EMPTY_AT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The view description of `view` if it is a shader view of a texture the
+/// title fills whose host copy has had no upload yet ([`fallback_on`]).
+fn empty_texture_view(view: &View) -> Option<[u32; 10]> {
+    if !fallback_on() {
+        return None;
+    }
+    let (resource, words) = match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            let View::Shader(texture, _) = placed_texture(view)? else {
+                return None;
+            };
+            (texture, desc[..10].try_into().ok()?)
+        }
+        View::Shader(texture, Some(desc)) => (*texture, *desc),
+        _ => return None,
+    };
+    let this = resource as crate::object::This;
+    if crate::resource::buffer_bytes(this).is_some()
+        || !crate::resource::title_fills(this)
+        || crate::texture::host_wrote(resource)
+        || crate::texture::filled(this)
+    {
+        return None;
+    }
+    Some(words)
+}
+
 /// Writes of a slot with another view of the placed texture it showed,
 /// since the start: the slot kept showing the old view.
 pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2165,6 +2319,9 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     if !TEXTURES.contains(&words[1]) {
         return null_view(at);
     }
+    if fallback_view(words, at) {
+        return;
+    }
     let Some(host) = host() else { return };
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
@@ -2183,6 +2340,196 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// Whether a texture slot with nothing to show (its texture not uploaded
+/// yet, streamed out, or refused) shows a neutral texture instead of a null
+/// view; `VICTORY_FALLBACK_TEXTURES=0` leaves it null, as before.
+///
+/// A null view reads zeros, alpha included, and the title's alpha-tested
+/// and dithered materials (clothing, fences, wall decals, parts of walls)
+/// discard every pixel of a draw whose texture reads alpha 0: the draw
+/// vanished instead of showing untextured, while its texture waited in the
+/// queue or its memory was not mapped. The neutral texture is mid grey
+/// with alpha 1 (a flat normal for two-channel normal maps, middling
+/// roughness), so such a draw shows as a plain surface until its texture
+/// arrives.
+fn fallback_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Slots given the neutral texture ([`fallback_on`]) since the start.
+pub(crate) static FALLBACK_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the host format `format` is read as integers (a float texture
+/// view of it would not match what the shader declares): those keep their
+/// null view.
+fn integer_format(format: u32) -> bool {
+    matches!(
+        format,
+        3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 22 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 47 | 50 | 52 | 57 | 59 | 62 | 64
+    )
+}
+
+/// The neutral textures, made once: a 2D texture of one slice, one of six
+/// (for cubes) and a 3D one, each 1x1 texel of mid grey with alpha 1, in
+/// the PC's memory where the CPU writes it directly. `None` where the host
+/// refuses one (the view stays null then).
+struct Fallbacks {
+    flat: Option<ID3D12Resource>,
+    cube: Option<ID3D12Resource>,
+    volume: Option<ID3D12Resource>,
+}
+
+fn fallbacks() -> &'static Fallbacks {
+    static MADE: std::sync::OnceLock<Fallbacks> = std::sync::OnceLock::new();
+    MADE.get_or_init(|| {
+        let make = |dimension: D3D12_RESOURCE_DIMENSION, depth: u16| -> Option<ID3D12Resource> {
+            let host = host()?;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: dimension,
+                Alignment: 0,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: depth,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+                Flags: D3D12_RESOURCE_FLAG_NONE,
+            };
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a plain committed texture; the out pointer is ours.
+            let made = unsafe {
+                host.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+            };
+            if let Err(e) = made {
+                tracing::warn!(error = %e, ?dimension, depth, "no neutral texture for slots with nothing to show; they stay null");
+                return None;
+            }
+            let texture = texture?;
+            let texel: [u8; 4] = [128, 128, 128, 255];
+            let subresources = if dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(depth) };
+            for sub in 0..subresources {
+                // SAFETY: a CPU-visible texture of ours; one texel of four
+                // bytes, written while mapped.
+                let written = unsafe {
+                    texture.Map(sub, None, None).and_then(|()| {
+                        let w = texture.WriteToSubresource(sub, None, texel.as_ptr().cast(), 4, 4);
+                        texture.Unmap(sub, None);
+                        w
+                    })
+                };
+                if let Err(e) = written {
+                    tracing::warn!(error = %e, ?dimension, "the neutral texture could not be written; slots with nothing to show stay null");
+                    return None;
+                }
+            }
+            crate::host::name(&texture, || format!("neutral texture {dimension:?} x{depth}"));
+            Some(texture)
+        };
+        let made = Fallbacks {
+            flat: make(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1),
+            cube: make(D3D12_RESOURCE_DIMENSION_TEXTURE2D, 6),
+            volume: make(D3D12_RESOURCE_DIMENSION_TEXTURE3D, 1),
+        };
+        tracing::info!(
+            flat = made.flat.is_some(),
+            cube = made.cube.is_some(),
+            volume = made.volume.is_some(),
+            "neutral textures for slots with nothing to show (VICTORY_FALLBACK_TEXTURES=0: null views)"
+        );
+        made
+    })
+}
+
+/// Makes slot `at` a view of the neutral texture of the title's view's
+/// dimension (`words`, its view description), if [`fallback_on`] and the
+/// view reads floats: 2D, 2D array, cube, cube array or 3D. False where it
+/// leaves the slot to the null view.
+fn fallback_view(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
+    if !fallback_on() || words[0] == 0 || integer_format(crate::resource::pc_format(words[0])) {
+        return false;
+    }
+    let Some(host) = host() else { return false };
+    let all = fallbacks();
+    let (texture, desc) = match words[1] {
+        4 => (
+            &all.flat,
+            D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+                },
+            },
+        ),
+        5 => (
+            &all.flat,
+            D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
+                },
+            },
+        ),
+        9 => (
+            &all.cube,
+            D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    TextureCube: D3D12_TEXCUBE_SRV { MipLevels: 1, ..Default::default() },
+                },
+            },
+        ),
+        10 => (
+            &all.cube,
+            D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV { MipLevels: 1, NumCubes: 1, ..Default::default() },
+                },
+            },
+        ),
+        8 => (
+            &all.volume,
+            D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture3D: D3D12_TEX3D_SRV { MipLevels: 1, ..Default::default() },
+                },
+            },
+        ),
+        _ => return false,
+    };
+    let Some(texture) = texture else { return false };
+    // SAFETY: a live texture of ours (kept for the run) and a slot of our heap.
+    unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
+    FALLBACK_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -2293,7 +2640,8 @@ mod tests {
     }
 
     /// The queue of textures picked by index serves the slots looked at
-    /// before first, then the newest write and the oldest in turns; a
+    /// before first, then the newest write and the oldest in turns, and
+    /// the slots uploaded in part last; a
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
@@ -2328,7 +2676,9 @@ mod tests {
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        // behind every slot never uploaded
+        assert_eq!(q.due(12, 100).last().map(|d| d.0), Some(16));
+        assert!(q.due(12, 100).len() > 1);
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
@@ -2348,6 +2698,25 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// Remapped ranges past the limit are joined into wider ones that
+    /// still cover every byte, never dropped.
+    #[test]
+    fn remapped_ranges_are_joined_not_dropped() {
+        let mut ranges: Vec<(u64, u64)> = (0..1000u64).rev().map(|i| (i * 0x30000, i * 0x30000 + 0x1000)).collect();
+        ranges.push((0x1000, 0x2000));
+        let all = ranges.clone();
+        coarsen(&mut ranges, 100);
+        assert!(ranges.len() <= 100);
+        assert!(ranges.windows(2).all(|w| w[0].1 < w[1].0));
+        for (start, end) in all {
+            assert!(ranges.iter().any(|&(s, e)| s <= start && end <= e), "{start:#x}..{end:#x}");
+        }
+        // Touching ranges join without widening.
+        let mut touching = vec![(8, 12), (0, 4), (4, 6)];
+        coarsen(&mut touching, 1000);
+        assert_eq!(touching, [(0, 6), (8, 12)]);
     }
 
     /// A view written over memory that older views describe otherwise

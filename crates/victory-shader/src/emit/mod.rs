@@ -82,6 +82,7 @@
 
 mod bitcode;
 mod container;
+mod lds_order;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -110,12 +111,13 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{set_host_max_wave, with_trace};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit,
+    SLOT_STRIDES_COUNT, SLOT_TRACE, TRACE_FIRST, TRACE_PIXEL, TRACE_THREAD, TRACE_WORDS,
+    USER_DATA_SPACE, USER_MEMORY_BASE, USER_MESH_ROW, USER_TRACE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, set_view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -188,6 +190,17 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// The payload bytes mesh shaders declare: 4 with
+/// `VICTORY_INDIRECT_AMPLIFY=1` (experiment: `victory-gpu` puts an
+/// amplification stage of its own before them, whose payload is one word
+/// they do not read; the host wants the two sizes to agree), else 0.
+/// shortcut: not in the shader cache's key; a cache made with the other
+/// setting holds mesh shaders of the other size.
+pub(crate) fn mesh_payload() -> u32 {
+    static BYTES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| if std::env::var_os("VICTORY_INDIRECT_AMPLIFY").is_some_and(|v| v == "1") { 4 } else { 0 })
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -239,6 +252,10 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Compute: host thread groups per console thread group, along z (1: the console's
+    /// groups as they are). With n > 1 each console group of n 64-lane waves runs as n host
+    /// groups of one wave: the dispatch's z count is multiplied by n.
+    pub group_split: u32,
 }
 
 impl HostShader {
@@ -461,11 +478,13 @@ pub fn emit(
                 }
             }
         }
-        // Last resort, since the host refuses `WaveSize(64)`: LDS read and written inside one
-        // lane-branch region without a barrier there ([`lower::with_loose_lds`]), first as
-        // the program is, then in its other forms, then with each host wave on its own.
-        // (`VICTORY_WAVE_LOOSE_LDS=0` turns it off.)
-        if !strict && std::env::var_os("VICTORY_WAVE_LOOSE_LDS").is_none_or(|v| v != "0") {
+        // Only when asked for (`VICTORY_WAVE_LOOSE_LDS=1`), since it can be wrong: LDS read
+        // and written inside one lane-branch region without a barrier there even where
+        // `lds_order` cannot prove that no thread sees another's write
+        // ([`lower::with_loose_lds`]), first as the program is, then in its other forms,
+        // then with each host wave on its own. (Run 20261124-174052 drew streaks across
+        // the screen with it on, run -174823 none with it off.)
+        if !strict && std::env::var_os("VICTORY_WAVE_LOOSE_LDS").is_some_and(|v| v == "1") {
             let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
             report("LDS without barriers in lane branches (APPROXIMATE)", &again);
             if done(&again) {
@@ -487,6 +506,33 @@ pub fn emit(
                 report("LDS without barriers in lane branches, local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last resort, for a program no other form translates (it was dropped): its per-lane
+        // branches taken wave-wide ([`widen`]), which is exact. Off as the general order
+        // above unless asked for (`VICTORY_WAVE_WIDE=1`), since moving programs that did
+        // translate to it lost the card (runs 121-124); here only programs that would
+        // otherwise not run at all take it. `VICTORY_WAVE_WIDE=0` turns this off too.
+        // (Grand Theft Auto VI's a53a7977fe762268, dispatched twice a frame: its light
+        // loops, wave ORs over the lanes' cluster masks, sit in lane branches and needed the
+        // two host waves to exchange there; 8 branches taken wave-wide.)
+        let wide_last = !wide_on && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        if wide_last {
+            let again = widen(c, native, p, why);
+            report("wave-wide branches, last resort", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            // the program's other forms, whose per-lane descriptors may track where the
+            // program's own do not with its branches taken wave-wide
+            for (name, f) in &forms {
+                if let Some((p, ..)) = f {
+                    let again = widen(c, native, p, why);
+                    report(&format!("wave-wide branches, last resort, {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
                 }
             }
         }
@@ -542,10 +588,34 @@ fn widen(
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
     };
+    let mut split = false;
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // Waves of one group that share nothing – no LDS, no barrier – never meet on the
+        // console either: each runs as its own host group (`lower::with_group_split`).
+        crate::native::StageIo::Cs(cs)
+            if group_split_on()
+                && cs.threads.iter().product::<u32>() % 64 == 0
+                && cs.lds_bytes() == 0
+                && !p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier") =>
+        {
+            if why {
+                eprintln!("WAVE64-WIDE thread groups of {:?} split into one host group per console wave", cs.threads);
+            }
+            split = true;
+        }
+        // Several console waves that share LDS or meet at barriers: the two host waves of a
+        // console wave meet on their own inside the branches it takes together, not at group
+        // barriers the group's other waves would have to come to (`lower::Lower::meet`).
+        crate::native::StageIo::Cs(cs)
+            if lower::pair_sync_on() && cs.threads.iter().product::<u32>() % 64 == 0 =>
+        {
+            if why {
+                eprintln!("WAVE64-WIDE thread groups of {:?}: the halves of each console wave meet on their own", cs.threads);
+            }
+        }
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -554,11 +624,41 @@ fn widen(
         }
         _ => return Err(NOT),
     }
+    if split {
+        return lower::with_group_split(|| widen_loop(c, native, p, why));
+    }
+    widen_loop(c, native, p, why)
+}
+
+/// `VICTORY_GROUP_SPLIT=0`: thread groups of several console waves are not split for
+/// wave-wide branches ([`widen`]).
+fn group_split_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GROUP_SPLIT").is_none_or(|v| v != "0"))
+}
+
+fn widen_loop(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let mut wide = std::collections::HashSet::new();
+    // The lanes' own paths, as the console takes them: what descriptors the lanes reaching an
+    // access hold follows from those, not from the branches the host takes wave-wide (a
+    // descriptor loaded inside a skip and read after its join: only lanes that ran the skip
+    // read it, which a wave-wide branch no longer says).
+    let lane_paths = structure::structure(p).ok();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        let res = match resource::track(p, &native.layout, native.stage, Some(&st)) {
+            Ok(res) => res,
+            Err(e) => match &lane_paths {
+                Some(lanes) => resource::track(p, &native.layout, native.stage, Some(lanes)).map_err(|_| e)?,
+                None => return Err(e),
+            },
+        };
         lower::take_needs();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
@@ -687,6 +787,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        group_split: l.group_split,
     };
     Ok((shader, wave_size))
 }
@@ -1062,6 +1163,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            group_split: 1,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1074,6 +1176,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                group_split: 1,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1363,6 +1466,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                group_split: 1,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -1537,6 +1641,11 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with(words, input_addr, false)
+    }
+
+    /// `pixel`, with TEXCOORD0 held as 16-bit values when `fp16`.
+    fn pixel_with(words: &[u32], input_addr: u32, fp16: bool) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1550,7 +1659,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1650,6 +1759,26 @@ mod barycentric_tests {
         let (features, inputs) = parts(&shader);
         assert_eq!(features & 0x2_0000, 0);
         assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        validate(&shader);
+    }
+
+    /// An f16 interpolation's first half keeps no value of its own (the second half writes
+    /// another VGPR and recomputes it). A `v_fma_mixlo_f16` into that VGPR keeps its high
+    /// half: zero then, as for other 16-bit writes, and the program translates.
+    /// Eight of the title's deferred material pixel programs do this.
+    #[test]
+    fn mixlo_over_an_f16_first_interpolation_half() {
+        let [e0, e1] = exp_mrt0(4);
+        let words = [
+            0xD742_0003, 0x0002_0000, // v_interp_p1ll_f16 v3, v0, attr0.x
+            0xD75A_0002, 0x040E_0200, // v_interp_p2_f16 v2, v1, attr0.x, v3
+            0xCC21_0003, 0x0A02_0502, // v_fma_mixlo_f16 v3, v2, v2, 0
+            0x7E08_1703,              // v_cvt_f32_f16 v4, v3
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel_with(&words, PERSP_CENTER, true).unwrap();
         validate(&shader);
     }
 

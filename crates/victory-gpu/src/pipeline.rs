@@ -65,6 +65,14 @@ pub(crate) struct Shader {
     translated: OnceLock<Option<Translated>>,
 }
 
+impl Shader {
+    /// The console container, as the title gave it.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+}
+
 impl std::fmt::Debug for Shader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} {}", self.stage, self.hash)
@@ -135,7 +143,7 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = translate(&self.container);
+                let done = translate(&self.container, &self.hash);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -173,7 +181,7 @@ impl Shader {
 }
 
 #[cfg(windows)]
-fn translate(container: &[u8]) -> Result<Translated, String> {
+fn translate(container: &[u8], hash: &str) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -182,7 +190,19 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    // `VICTORY_SHADER_TRACE`: translated traced, not from the cache (`crate::debugger::trace`)
+    #[cfg(feature = "diagnostics")]
+    let host = if crate::debugger::trace::traced(hash) {
+        tracing::info!(hash, "shader translated traced (VICTORY_SHADER_TRACE)");
+        victory_shader::emit::with_trace(|| victory_shader::emit::translate(container)).map_err(|e| e.to_string())?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let host = {
+        let _ = hash;
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
@@ -553,6 +573,8 @@ pub(crate) extern "system" fn create_graphics(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(windows)]
+    crate::device::cached_compute::forget();
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
@@ -655,6 +677,8 @@ pub(crate) extern "system" fn create_stream(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    #[cfg(windows)]
+    crate::device::cached_compute::forget();
     // SAFETY: the title passes a description (null is tolerated).
     let Some(desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;

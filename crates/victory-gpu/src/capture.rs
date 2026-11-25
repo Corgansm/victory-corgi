@@ -12,7 +12,15 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| {
+            std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from).or_else(|| {
+                // the debugger's recordings go to its folder (`crate::debugger`)
+                #[cfg(feature = "diagnostics")]
+                return crate::debugger::dir().cloned();
+                #[cfg(not(feature = "diagnostics"))]
+                None
+            })
+        })
         .as_ref()
 }
 
@@ -47,6 +55,10 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
+    #[cfg(feature = "diagnostics")]
+    if crate::debugger::records(n) {
+        return true;
+    }
     named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
@@ -58,6 +70,7 @@ pub(crate) fn listed(n: u64) -> bool {
 /// stays empty.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
+    use std::fmt::Write as _;
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
     if !listed(frame) {
@@ -103,6 +116,19 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     }
     if let Some((_, n, f)) = file.as_mut() {
         *n += 1;
+        // the debugger's numbers for the operation: its pixel reads and its shader trace
+        // (the tag of a traced shader's bind goes to the draw or dispatch, not to a copy
+        // made while binding)
+        let runs = ["draw", "indexed", "mesh", "dispatch", "indirect"].iter().any(|k| what.starts_with(k));
+        let op = crate::debugger::pixel::current_op();
+        let tag = if runs { crate::debugger::trace::current_tag() } else { 0 };
+        let mut what = what;
+        if op != 0 {
+            let _ = write!(what, " [op {op}]");
+        }
+        if tag != 0 {
+            let _ = write!(what, " [tag {tag}]");
+        }
         let _ = writeln!(f, "{n} list {list:#x} {what}");
     }
 }
@@ -152,7 +178,9 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    // (the debugger's folder alone: only its recordings)
+    let own = std::env::var_os("VICTORY_CAPTURE").is_some();
+    folder().is_some() && (own && (n.is_power_of_two() || before_world || in_world) || listed(n))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -161,7 +189,7 @@ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, ro
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+pub(crate) fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
     let (w, h) = ((width / 2).max(1), (height / 2).max(1));
     // Filter byte 0 per row, then RGB of every other pixel of every other row.
@@ -342,7 +370,9 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+    *ON.get_or_init(|| {
+        folder().is_some() && (std::env::var_os("VICTORY_DUMP_TARGETS").is_some() || crate::debugger::on())
+    })
 }
 
 /// Notes a title texture the frame being built renders to or writes.
@@ -545,7 +575,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
-fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);

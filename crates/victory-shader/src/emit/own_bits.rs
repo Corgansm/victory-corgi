@@ -59,6 +59,26 @@ const EXIT: Why = "a loop over a wave OR's bits left another way";
 const STALE: Why = "a lane's own-bit test used outside its round";
 const MASK: Why = "a wave OR over a mask a running lane may be outside";
 
+/// Whether a loop over a wave OR's bits whose lanes all run every round (no lane tests its
+/// own bit) may take the host wave's OR too (only with `VICTORY_WAVE_UNION_LOOPS=1`: it is
+/// exact only as far as the reasoning below holds, which the code alone does not prove).
+///
+/// The title's clustered light loops are of this shape: each lane reads the light mask of its
+/// cluster (a 3D texture of 32-bit words), the masks are ORed over the wave, and every lane
+/// evaluates every light of the OR (a53a7977fe762268, 0xa668 on: `image_load` of the mask,
+/// the OR, then `s_ff1`, the light's constants by its number, the lighting, and the bit
+/// cleared). The masks say which lights reach a cluster at all: a light outside a lane's own
+/// mask adds exactly nothing to that lane (its falloff is zero past its range, which is how
+/// the culling that wrote the masks placed it). The host wave's OR holds the lane's own mask,
+/// so each lane sums the same nonzero terms in the same rising order as on the console; only
+/// rounds that add zero are left out. Accepted when the loop, as for [`find`]'s own loops,
+/// has no effect (store, atomic, export, LDS write, message), no cross-lane step and no other
+/// use of the bits than the loop's own steps; what the rounds compute may leave the loop.
+fn union_loops() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_UNION_LOOPS").is_some_and(|v| v == "1"))
+}
+
 /// What [`find`] proved.
 #[derive(Debug, Default)]
 pub(super) struct OwnBits {
@@ -619,7 +639,45 @@ impl Ctx<'_> {
             }
         }
         if tests.is_empty() {
-            return Err((head, TEST));
+            // Every lane runs every round, over the whole set ([`union_loops`]).
+            if !union_loops() {
+                return Err((head, TEST));
+            }
+            for b in (0..n).filter(|&b| lp[b] || pre[b]) {
+                for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+                    let u = (b, i);
+                    if pattern.contains(&u) {
+                        continue;
+                    }
+                    if effect(inst) {
+                        return Err((self.at(u), EFFECT));
+                    }
+                    let name = inst.name();
+                    let cross = name.starts_with("ds_swizzle")
+                        || name.contains("permute")
+                        || name.starts_with("v_mbcnt")
+                        || name.contains("lane")
+                        || matches!(&inst.fields, Fields::Valu(v) if v.dpp.is_some())
+                        || super::lower::reads_mask_as_data(st, inst)
+                        || self.sections[b].iter().any(|(&s, sec)| i >= s && i <= sec.end);
+                    if cross {
+                        return Err((self.at(u), CROSS));
+                    }
+                    if used(p, st, b, i).iter().any(|v| rem.contains(v)) {
+                        return Err((self.at(u), USED));
+                    }
+                }
+                if lp[b] {
+                    let ok = match p.blocks[b].exit {
+                        Exit::End | Exit::Indirect => false,
+                        ref e => leaves.contains(&b) || e.successors().iter().all(|&s| lp[s]),
+                    };
+                    if !ok {
+                        return Err((p.blocks[b].offset, EXIT));
+                    }
+                }
+            }
+            return Ok(alike);
         }
         let mut memo: Vec<HashMap<Bool, bool>> = vec![HashMap::new(); tests.len()];
         // what a lane only reaches with its own bit set, in the round of that test

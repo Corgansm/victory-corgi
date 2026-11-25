@@ -471,8 +471,10 @@ pub(crate) mod cached_compute {
 
     use crate::object::{HRESULT, Iid, This};
 
-    /// The file's name in the pipeline library's folder.
-    const FILE: &str = "cached-compute.bin";
+    /// The file's name in the pipeline library's folder. ("-2": the file before kept
+    /// pairs a cache hit learned under another call's key, and may hand out a wrong
+    /// shader for an entry; it is left as it is, unread.)
+    const FILE: &str = "cached-compute-2.bin";
     /// The largest range read for a key.
     const MAX_RANGE: u64 = 1 << 20;
     /// The largest container kept.
@@ -480,8 +482,18 @@ pub(crate) mod cached_compute {
 
     thread_local! {
         /// The key of this thread's last failed call, until the title's
-        /// next compute pipeline on the thread.
+        /// next pipeline on the thread.
         static PENDING: Cell<Option<[u8; 32]>> = const { Cell::new(None) };
+        /// A compute pipeline made from a kept container (`serve`) is under way on this
+        /// thread: it is no fallback, and learns nothing.
+        static SERVING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// The thread's next pipeline is not the fallback of its last failed call: what made
+    /// a pipeline in between (a graphics or stream pipeline, another cached call) breaks
+    /// the pair, and nothing is learned from it.
+    pub(crate) fn forget() {
+        PENDING.with(|p| p.set(None));
     }
 
     /// Calls answered from a kept container, and containers learned.
@@ -554,6 +566,10 @@ pub(crate) mod cached_compute {
         if !on() {
             return None;
         }
+        // Another cached call: whatever the last one left waits no more. (A hit used to make
+        // its pipeline with the last miss still waiting, and the hit's container was learned
+        // under the miss's key, kept on disk, and handed out for it from then on.)
+        forget();
         let key = key(desc)?;
         let container = kept().lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
         let Some(container) = container else {
@@ -563,7 +579,9 @@ pub(crate) mod cached_compute {
         // SAFETY: the entry's first word is the root signature (read above
         // with the rest of the words, so mapped).
         let root = unsafe { desc.cast::<This>().read_unaligned() };
+        SERVING.with(|s| s.set(true));
         let hr = crate::pipeline::create_compute_from(this, root, &container, iid, out);
+        SERVING.with(|s| s.set(false));
         let served = SERVED.fetch_add(1, Ordering::Relaxed) + 1;
         if served.is_power_of_two() {
             tracing::info!(served, hr, "cached compute pipelines made from the containers their fallbacks used");
@@ -574,6 +592,9 @@ pub(crate) mod cached_compute {
     /// The title makes a compute pipeline from `container` on this thread:
     /// kept under the key of the failed call before it, if one waits.
     pub(crate) fn learn(container: &[u8]) {
+        if SERVING.with(Cell::get) {
+            return;
+        }
         let Some(key) = PENDING.with(|p| p.take()) else {
             return;
         };
