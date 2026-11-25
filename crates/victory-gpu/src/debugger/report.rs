@@ -165,6 +165,9 @@ img.th{width:48px;height:48px;object-fit:contain;image-rendering:pixelated;backg
 <section id="tex"><p class="note">Every title texture alive. "host" = the card has its copy; "filled" = an upload reached that copy (a texture the title fills that is not filled shows the neutral grey fallback); "refused" = the card would not make it.</p>
 <input id="txf" placeholder="filter id / format / size"> <select id="txs"><option value="">all</option><option value="nohost">no host copy</option><option value="unfilled">title fills, not filled</option><option value="refused">refused</option><option value="recent">used in the last 10 frames</option></select>
 <table><thead><tr><th data-k="preview">pic</th><th data-k="id">texture</th><th data-k="addr">address</th><th data-k="kind">dim</th><th data-k="w">size</th><th data-k="mips">mips</th><th data-k="format">format</th><th data-k="host">state</th><th data-k="mb">MB</th><th data-k="ago">frames ago</th></tr></thead><tbody id="txb"></tbody></table></section>
+<section id="pipes"><p class="note">Every pipeline the recorded frames ran: its shaders, how many operations used it, and its whole graphics state (depth, stencil, rasterizer, topology, samples, each target's format and blend, the input layout). Click a row for the targets it drew into.</p>
+<input id="ppf" placeholder="filter shader hash / state…" size="60">
+<table><thead><tr><th>ops</th><th>pipeline / shaders</th><th>state</th></tr></thead><tbody id="ppb"></tbody></table></section>
 <section id="trc"><p class="note">Shaders named in VICTORY_SHADER_TRACE, for the picked pixel (pixel shaders) or thread (compute): each console instruction the lane ran and the registers it wrote, in order.</p><div id="trb"></div></section>
 <section id="tgt"><div class="grid" id="tgb"></div></section>
 <script>
@@ -173,7 +176,7 @@ const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 $('fr').textContent=FRAME;
 $('sum').textContent=`${OPS.length} operations · ${PICTURES.length} target pictures · ${PIXELS.length} pixel reads · ${TEXTURES.length} textures · ${TRACES.length} shader traces · ${REQUEST}`;
-const tabs=[['ops','Operations'],['pix','Pixel history'],['tex','Textures'],['trc','Shader traces'],['tgt','Targets']];
+const tabs=[['ops','Operations'],['pix','Pixel history'],['pipes','Pipelines'],['tex','Textures'],['trc','Shader traces'],['tgt','Targets']];
 for(const [id,name] of tabs){const b=document.createElement('button');b.textContent=name;b.onclick=()=>{for(const [i] of tabs){$(i).classList.toggle('on',i==id);}for(const x of $('tabs').children)x.classList.toggle('on',x==b);};$('tabs').append(b);}
 $('tabs').children[PIXELS.length?1:0].click();
 // operations
@@ -183,6 +186,8 @@ function parseOp(line){const m=line.match(/^(\d+) list (0x[0-9a-f]+) (.*)$/);if(
  const shaders=[...rest.matchAll(/\| ([0-9a-f]{16}):/g)].map(x=>x[1]);
  return{n:m[1],list:m[2],kind,rest,pipe,tg,shaders,op,tag,drop:/drop/i.test(rest)};}
 const OPP=OPS.map(parseOp);
+const BYOP={};for(const o of OPP){if(o.op)BYOP[o.op]=o;}
+const stateOf=o=>(o.rest.match(/state \[(.*?)\] (?:scissor|viewport|\|)/)||o.rest.match(/state \[(.*?)\]/)||['',''])[1];
 function drawOps(){const f=$('opf').value.toLowerCase();const d=$('opdrop').checked;let last='';const rows=[];
  for(const o of OPP){if(f&&!o.rest.toLowerCase().includes(f))continue;if(d&&!o.drop)continue;
   if(o.tg&&o.tg!=last){rows.push(`<tr class="pass"><td colspan="5">pass → ${esc(o.tg)}</td></tr>`);last=o.tg;}
@@ -196,10 +201,19 @@ const sw=v=>{if(!v.length)return'';const c=v.slice(0,3).map(x=>Math.round(Math.m
 function drawPix(){const ch=$('pxch').checked,f=$('pxf').value.toLowerCase();const by={};
  for(const s of PIXELS){const k=s.op+'/'+s.target;(by[k]=by[k]||{op:s.op,label:s.label,target:s.target,s})[s.after?'a':'b']=s;}
  const rows=[];for(const r of Object.values(by).sort((x,y)=>x.op-y.op)){const b=r.b,a=r.a;const changed=a&&b&&a.hex!=b.hex;
-  if(ch&&!changed)continue;if(f&&!(r.label+r.target).toLowerCase().includes(f))continue;
-  rows.push(`<tr class="${changed?'changed':''}"><td class="mono">${r.op}</td><td class="mono">${esc(r.label)}</td><td class="mono">${r.target}<br>${r.s.w}x${r.s.h} f${r.s.format}</td><td class="mono">${r.s.x},${r.s.y}</td><td class="mono">${b?sw(b.v)+fmtv(b.v)+'<br>'+b.hex:''}</td><td class="mono">${a?sw(a.v)+fmtv(a.v)+'<br>'+a.hex:''}</td></tr>`);}
+  const lone=b&&!a;if(ch&&!changed&&!lone)continue;if(f&&!(r.label+r.target).toLowerCase().includes(f))continue;
+  const o=BYOP[r.op];const det=o?`<div class="detail">${esc(stateOf(o))}\n\n${esc(o.rest)}</div>`:'';
+  rows.push(`<tr class="${changed?'changed':''}" onclick="this.classList.toggle('open')"><td class="mono">${r.op}</td><td class="mono">${esc(r.label)}${lone?' <span class="tag mid">depth before the draw</span>':''}${det}</td><td class="mono">${r.target}<br>${r.s.w}x${r.s.h} f${r.s.format}</td><td class="mono">${r.s.x},${r.s.y}</td><td class="mono">${b?sw(b.v)+fmtv(b.v)+'<br>'+b.hex:''}</td><td class="mono">${a?sw(a.v)+fmtv(a.v)+'<br>'+a.hex:''}</td></tr>`);}
  $('pxb').innerHTML=rows.join('')||'<tr><td colspan=6>No pixel reads: press F9 with the mouse over the game.</td></tr>';}
 $('pxch').onchange=drawPix;$('pxf').oninput=drawPix;drawPix();
+// pipelines
+const PIPES={};for(const o of OPP){if(!o.pipe)continue;const k=o.pipe.trim();const p=(PIPES[k]=PIPES[k]||{pipe:k,n:0,state:'',targets:new Set()});p.n++;const st=stateOf(o);if(st)p.state=st;if(o.tg)p.targets.add(o.tg);}
+function drawPipes(){const f=$('ppf').value.toLowerCase();const rows=[];
+ for(const p of Object.values(PIPES).sort((a,b)=>b.n-a.n)){if(f&&!(p.pipe+p.state).toLowerCase().includes(f))continue;
+  rows.push(`<tr onclick="this.classList.toggle('open')"><td class="mono">${p.n}</td><td class="mono">${esc(p.pipe)}<div class="detail">${esc([...p.targets].join('\n'))}</div></td><td class="mono">${esc(p.state).replace(/; /g,'<br>')}</td></tr>`);
+  if(rows.length>3000)break;}
+ $('ppb').innerHTML=rows.join('');}
+$('ppf').oninput=drawPipes;drawPipes();
 // textures
 let txk='ago',txd=1;
 function drawTex(){const f=$('txf').value.toLowerCase(),s=$('txs').value;let l=TEXTURES.filter(t=>{

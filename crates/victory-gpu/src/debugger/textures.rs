@@ -296,7 +296,9 @@ pub(crate) fn png(path: &std::path::Path, w: u32, h: u32, rgba: &[u8]) -> bool {
     header.extend(h.to_be_bytes());
     header.extend([8, 6, 0, 0, 0]);
     chunk(&mut out, b"IHDR", &header);
-    chunk(&mut out, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3));
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, _) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    chunk(&mut out, b"IDAT", idat);
     chunk(&mut out, b"IEND", &[]);
     std::fs::write(path, out).is_ok()
 }

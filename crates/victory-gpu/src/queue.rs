@@ -908,6 +908,17 @@ extern "system" fn present(
             *waiting += 1;
         }
         lock(&queue(this).held).push(Held::Present(Box::new(move || {
+            // The diagnostics a present drives (target dumps, the debugger's keys, commands
+            // and recordings), here as the frame is shown: the title's present returned
+            // before them, and F9 did nothing with `VICTORY_ASYNC_SUBMIT=1`.
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::capture::frame_drew(frame, crate::draw::drawn());
+                if crate::capture::listed(frame) {
+                    crate::capture::dump_targets(frame);
+                }
+                crate::debugger::on_present(frame);
+            }
             let Some(resource) = shown.map(|r| r as This) else {
                 return;
             };

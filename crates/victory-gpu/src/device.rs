@@ -613,6 +613,10 @@ pub(crate) mod cached_compute {
                 record.extend_from_slice(&key);
                 record.extend_from_slice(&(container.len() as u32).to_le_bytes());
                 record.extend_from_slice(container);
+                // A new cache folder (`VICTORY_CACHE_DIR`) has no `pipelines` folder yet.
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
                 let written = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)

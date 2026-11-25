@@ -5,8 +5,10 @@
 //! report lists the operations that changed it.
 //!
 //! The pixel is the same fraction of every texture (a half-size target's
-//! texel under the same point of the screen). Depth-stencil and multisampled
-//! textures are left out: the host copies those only whole.
+//! texel under the same point of the screen). Multisampled textures are left
+//! out. The depth target, which the host copies only whole, is read by a
+//! one-thread compute pass of ours before each draw that binds it ([`depth`]),
+//! its depth plane as a float: what the draw tests against.
 
 use std::cell::RefCell;
 use std::sync::Mutex;
@@ -59,6 +61,9 @@ thread_local! {
     static UAVS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     /// The operation [`before`] numbered last on this thread, for the listing.
     static CURRENT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Depth reads [`depth`] recorded for the operation being bound: [`before`]
+    /// numbers them.
+    static PENDING: RefCell<Vec<Sample>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Readies the reads for frame `frame` (when a pixel is picked).
@@ -146,6 +151,17 @@ pub(crate) fn before(list: &HostList, targets: &[(usize, u32)], label: impl FnOn
     let op = OPS.fetch_add(1, Relaxed) + 1;
     CURRENT.with(|c| c.set(op));
     let label = label();
+    let pending = PENDING.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    if !pending.is_empty() {
+        let mut guard = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(probe) = guard.as_mut() {
+            probe.samples.extend(pending.into_iter().map(|mut s| {
+                s.op = op;
+                s.label.clone_from(&label);
+                s
+            }));
+        }
+    }
     for &(t, state) in &all {
         read(list, t, state, op, &label, false);
     }
@@ -167,12 +183,21 @@ fn read(list: &HostList, t: usize, state: u32, op: u64, label: &str, after: bool
     let Some(texture) = crate::resource::host_resource(t as This) else { return };
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
-    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-        || d.SampleDesc.Count > 1
-        || d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
-        || d.Width == 0
-        || d.Height == 0
-    {
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 || d.Width == 0 || d.Height == 0 {
+        return;
+    }
+    // A depth texture a shader writes through unordered access: what it writes are its
+    // colour twins (the depth plane's, the stencil plane's), each a target of its own.
+    if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+        const UNORDERED_ACCESS: u32 = 0x8;
+        if state == UNORDERED_ACCESS {
+            let x = ((pick.0 * d.Width as f32) as u32).min(d.Width as u32 - 1);
+            let y = ((pick.1 * d.Height as f32) as u32).min(d.Height - 1);
+            list.with_twins_readable(t as This, |twin, view| {
+                let id = windows::core::Interface::as_raw(twin) as usize;
+                probe(list, twin, view, id, (d.Width, d.Height), (x, y), Some((op, label, after)));
+            });
+        }
         return;
     }
     let x = ((pick.0 * d.Width as f32) as u32).min(d.Width as u32 - 1);
@@ -224,6 +249,242 @@ fn read(list: &HostList, t: usize, state: u32, op: u64, label: &str, after: bool
         slot,
         bytes: Vec::new(),
     });
+}
+
+/// Our pass that reads one texel of a depth plane: root constants (x, y, the probe
+/// slot), a table with the depth texture's view, the buffer it writes the float to.
+struct DepthPass {
+    root: ID3D12RootSignature,
+    pso: ID3D12PipelineState,
+    heap: ID3D12DescriptorHeap,
+    cpu: usize,
+    gpu: u64,
+    step: u32,
+    /// Floats, one per probe slot, on the card: copied into the readback slot.
+    floats: ID3D12Resource,
+    next: std::sync::atomic::AtomicU32,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for DepthPass {}
+// SAFETY: as above.
+unsafe impl Sync for DepthPass {}
+
+const DEPTH_VIEWS: u32 = 4096;
+
+const DEPTH_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(SRV(t0)), UAV(u0)"
+cbuffer C : register(b0) { uint x; uint y; uint slot; uint unused; };
+Texture2D<float> depth : register(t0);
+RWByteAddressBuffer floats : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() { floats.Store(slot * 4, asuint(depth.Load(int3(x, y, 0)))); }
+"#;
+
+fn depth_pass() -> Option<&'static DepthPass> {
+    static PASS: std::sync::OnceLock<Option<DepthPass>> = std::sync::OnceLock::new();
+    PASS.get_or_init(|| {
+        let made = make_depth_pass();
+        if let Err(e) = &made {
+            tracing::warn!(error = %e, "debugger: no depth reads in the pixel history");
+        }
+        made.ok()
+    })
+    .as_ref()
+}
+
+fn make_depth_pass() -> windows::core::Result<DepthPass> {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let host = crate::host::host().ok_or_else(windows::core::Error::empty)?;
+    let device = &host.device;
+    let mut code: Option<ID3DBlob> = None;
+    let mut errors: Option<ID3DBlob> = None;
+    // SAFETY: the source and names live through the call; out pointers ours.
+    let compiled = unsafe {
+        D3DCompile(
+            DEPTH_SOURCE.as_ptr().cast(),
+            DEPTH_SOURCE.len(),
+            windows::core::s!("depth"),
+            None,
+            None,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        if let Some(errors) = errors {
+            // SAFETY: the blob's own bytes.
+            let text = unsafe { std::slice::from_raw_parts(errors.GetBufferPointer().cast::<u8>(), errors.GetBufferSize()) };
+            tracing::warn!("debugger depth read: {}", String::from_utf8_lossy(text));
+        }
+        return Err(e);
+    }
+    let code = code.ok_or_else(windows::core::Error::empty)?;
+    // SAFETY: the blob's own bytes, with its root signature; plain creation.
+    unsafe {
+        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+            ..Default::default()
+        })?;
+        let heap: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: DEPTH_VIEWS,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })?;
+        let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: u64::from(SLOTS) * 4,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut floats: Option<ID3D12Resource> = None;
+        device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut floats)?;
+        let floats = floats.ok_or_else(windows::core::Error::empty)?;
+        Ok(DepthPass {
+            cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr,
+            gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
+            root,
+            pso,
+            heap,
+            step,
+            floats,
+            next: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+}
+
+/// Before a draw binds anything (diagnostics): reads the picked texel of depth target
+/// `depth`'s depth plane, as it is before the draw, into the pixel history. True if it
+/// recorded our pass: it set a pipeline, root signature and heaps of ours, which the
+/// caller then sets again.
+pub(crate) fn depth(list: &HostList, depth: usize) -> bool {
+    const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
+    if !active() {
+        return false;
+    }
+    let Some(pick) = super::pick() else { return false };
+    let Some(texture) = crate::resource::host_resource(depth as This) else { return false };
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 || d.Width == 0 || d.Height == 0 {
+        return false;
+    }
+    // The depth plane as a float or normalized value.
+    let view = match d.Format.0 {
+        19 | 20 | 21 => 21, // R32G8X24: R32_FLOAT_X8X24_TYPELESS
+        44 | 45 | 46 => 46, // R24G8: R24_UNORM_X8_TYPELESS
+        39 | 40 | 41 => 41, // R32: R32_FLOAT
+        53 | 55 | 56 => 56, // R16: R16_UNORM
+        _ => return false,
+    };
+    let x = ((pick.0 * d.Width as f32) as u32).min(d.Width as u32 - 1);
+    let y = ((pick.1 * d.Height as f32) as u32).min(d.Height - 1);
+    crate::list::ensure_state(list, depth as This, NON_PIXEL_SHADER_RESOURCE);
+    if !probe(list, texture, view, depth, (d.Width, d.Height), (x, y), None) {
+        return false;
+    }
+    // A depth texture compute writes has a colour twin of its depth plane, drawn into the
+    // plane before draws test it (`HostList::plane_ahead`); its texel too, as a target of
+    // its own (the twin's address), so the history shows both sides: a class the title's
+    // compute wrote that never reached the plane shows in the twin and not in the depth.
+    list.with_twins_readable(depth as This, |twin, view| {
+        probe(list, twin, view, windows::core::Interface::as_raw(twin) as usize, (d.Width, d.Height), (x, y), None);
+    });
+    true
+}
+
+/// Records our pass that reads texel `at` of `texture` (in a shader-readable state) through
+/// a view in format `view` into the next readback slot, as a sample of `target`: of operation
+/// `of` (its number, label, and whether after it), or else of the next operation numbered.
+fn probe(
+    list: &HostList,
+    texture: &ID3D12Resource,
+    view: i32,
+    target: usize,
+    size: (u64, u32),
+    at: (u32, u32),
+    of: Option<(u64, &str, bool)>,
+) -> bool {
+    let Some(pass) = depth_pass() else { return false };
+    let mut guard = PROBE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(probe) = guard.as_mut() else { return false };
+    if probe.next >= SLOTS {
+        return false;
+    }
+    let slot = probe.next;
+    probe.next += 1;
+    let readback = probe.buffer.clone();
+    drop(guard);
+    let Some(host) = crate::host::host() else { return false };
+    let index = pass.next.fetch_add(1, Relaxed) % DEPTH_VIEWS;
+    let cpu = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: pass.cpu + (index * pass.step) as usize };
+    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: pass.gpu + u64::from(index * pass.step) };
+    let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT(view),
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: 0, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 },
+        },
+    };
+    let to_uav = crate::host::transition(&pass.floats, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    let to_copy = crate::host::transition(&pass.floats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    let to_common = crate::host::transition(&pass.floats, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    let constants = [at.0, at.1, slot, 0];
+    // SAFETY: an open list; our heap, pipeline and buffers live as long as the process;
+    // the view names a live texture in a shader-readable state.
+    unsafe {
+        host.device.CreateShaderResourceView(texture, Some(&srv), cpu);
+        let l = &list.list;
+        l.ResourceBarrier(&[to_uav]);
+        l.SetDescriptorHeaps(&[Some(pass.heap.clone())]);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetPipelineState(&pass.pso);
+        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, gpu);
+        l.SetComputeRootUnorderedAccessView(2, pass.floats.GetGPUVirtualAddress());
+        l.Dispatch(1, 1, 1);
+        l.ResourceBarrier(&[to_copy]);
+        l.CopyBufferRegion(&readback, u64::from(slot) * SLOT_BYTES, &pass.floats, u64::from(slot) * 4, 4);
+        l.ResourceBarrier(&[to_common]);
+    }
+    list.keep(&readback);
+    let sample = Sample {
+        op: of.map_or(0, |o| o.0),
+        label: of.map_or_else(String::new, |o| o.1.to_owned()),
+        after: of.is_some_and(|o| o.2),
+        target,
+        format: 41,
+        size,
+        texel: at,
+        slot,
+        bytes: Vec::new(),
+    };
+    if of.is_some() {
+        if let Some(probe) = PROBE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            probe.samples.push(sample);
+        }
+    } else {
+        PENDING.with(|p| p.borrow_mut().push(sample));
+    }
+    true
 }
 
 /// The samples of the recorded frame with their bytes (the frame has run).
