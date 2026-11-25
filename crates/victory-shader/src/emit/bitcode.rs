@@ -425,6 +425,23 @@ impl Module {
         rest
     }
 
+    /// As [`Module::split`], but `block` branches on `cond`: to `then` (which the caller fills
+    /// and leads to the block returned), or straight to the block returned. For code only some
+    /// lanes run where it stands (one lane's atomic, a spin wait of one thread).
+    pub fn split_if(&mut self, block: usize, cond: V, then: usize) -> usize {
+        let head = self.end_of(block);
+        let rest = self.split(head, then);
+        self.blocks[head].term = Some(Term::CondBr(cond, then, rest));
+        rest
+    }
+
+    /// The blocks that end the function (`ret`), as the code stands now.
+    pub fn returns(&self) -> Vec<usize> {
+        (0..self.blocks.len())
+            .filter(|&b| matches!(self.blocks[b].term, Some(Term::Ret)))
+            .collect()
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,

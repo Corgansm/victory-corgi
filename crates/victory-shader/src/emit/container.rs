@@ -72,7 +72,12 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), and those of one
+    // register by their name's offset: the order of the elements, not of
+    // their columns. (Sorted by column, the 16 programs of Grand Theft
+    // Auto VI's whose second element of a row sits in the lower columns
+    // had a part the validator's own did not match: "Container part
+    // 'Program Input Signature' does not match expected for module".)
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +95,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -113,6 +118,38 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         out.push(0);
     }
     out
+}
+
+/// Elements packed into one row are interpolated one way (the validator:
+/// "has interpolation mode that differs from another element packed into
+/// the same row"). An integer element is constant, so a float element the
+/// title packed beside one was declared `nointerpolation`; the signature
+/// part does not say so, and by default a float is linear. The row takes
+/// the mode of its integer elements, else, with `read_decides` (pixel
+/// inputs, whose reads say how they are interpolated), of the elements the
+/// program reads; the arbitrary elements that differ follow, those read
+/// another way excepted (that is the program's own doing, and stays told).
+pub(crate) fn settle_row_modes(elements: &mut [SigElement], read_decides: bool) {
+    for i in 0..elements.len() {
+        let Some(row) = elements[i].row else { continue };
+        if elements[..i].iter().any(|e| e.row == Some(row)) {
+            continue;
+        }
+        let of_row = |e: &&SigElement| e.row == Some(row) && e.interp != 0;
+        let mode = elements
+            .iter()
+            .filter(of_row)
+            .find(|e| e.comp != 9)
+            .or_else(|| elements.iter().filter(of_row).find(|e| read_decides && e.usage != 0))
+            .map(|e| e.interp);
+        let Some(mode) = mode else { continue };
+        for e in elements.iter_mut() {
+            let follows = e.row == Some(row) && e.kind == 0 && e.interp != 0 && e.interp != mode;
+            if follows && !(read_decides && e.usage != 0) {
+                e.interp = mode;
+            }
+        }
+    }
 }
 
 /// The most a mesh shader's outputs may take, in bytes (D3D12).
@@ -416,5 +453,51 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(hex, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    fn element(name: &str, index: u32, comp: u8, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement { name: name.into(), index, kind: 0, comp, interp: if comp == 9 { 2 } else { 1 }, row: Some(row), col, cols, usage: 0, half: false }
+    }
+
+    /// The rows of one register follow the elements' order (their names'
+    /// offsets), not their columns: Grand Theft Auto VI's vertex program
+    /// 1707628854aa2241 has TEXCOORD3 in column 3 of row 5 before NORMAL0
+    /// in columns 0 to 2, and the validator writes them in that order.
+    #[test]
+    fn rows_of_one_register_keep_the_elements_order() {
+        let elements = [
+            element("TEXCOORD", 5, 9, 4, 0, 4),
+            element("TEXCOORD", 3, 9, 5, 3, 1),
+            element("NORMAL", 0, 9, 5, 0, 3),
+            element("TEXCOORD", 2, 9, 3, 0, 2),
+        ];
+        let part = signature(&elements, false);
+        let row = |i: usize| {
+            let at = 8 + 32 * i;
+            let u = |o: usize| u32::from_le_bytes(part[at + o..at + o + 4].try_into().unwrap());
+            let name: String = part[u(4) as usize..].iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+            (name, u(8), u(20), part[at + 24])
+        };
+        assert_eq!(row(0), ("TEXCOORD".to_owned(), 2, 3, 0b0011));
+        assert_eq!(row(1), ("TEXCOORD".to_owned(), 5, 4, 0b1111));
+        assert_eq!(row(2), ("TEXCOORD".to_owned(), 3, 5, 0b1000));
+        assert_eq!(row(3), ("NORMAL".to_owned(), 0, 5, 0b0111));
+    }
+
+    /// A float packed beside an integer is constant like it (mesh program
+    /// 0bd4d80ad23b106b: TEXCOORD8, a uint, and TEXCOORD11 in row 9); a
+    /// pixel input that is not read follows the one that is, and one read
+    /// another way is left as the program reads it.
+    #[test]
+    fn a_row_has_one_interpolation_mode() {
+        let mut outputs = [element("TEXCOORD", 8, 5, 9, 0, 3), element("TEXCOORD", 11, 9, 9, 3, 1), element("TEXCOORD", 9, 9, 10, 0, 4)];
+        settle_row_modes(&mut outputs, false);
+        assert_eq!(outputs.each_ref().map(|e| e.interp), [1, 1, 2]);
+        let mut inputs = [element("TEXCOORD", 0, 9, 1, 0, 2), element("TEXCOORD", 1, 9, 1, 2, 2), element("TEXCOORD", 2, 9, 2, 0, 2), element("TEXCOORD", 3, 9, 2, 2, 2)];
+        (inputs[1].interp, inputs[1].usage) = (5, 0b11);
+        (inputs[2].interp, inputs[2].usage) = (2, 0b01);
+        (inputs[3].interp, inputs[3].usage) = (5, 0b11);
+        settle_row_modes(&mut inputs, true);
+        assert_eq!(inputs.each_ref().map(|e| e.interp), [5, 5, 2, 5]);
     }
 }

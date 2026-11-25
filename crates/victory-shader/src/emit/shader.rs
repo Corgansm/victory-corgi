@@ -83,6 +83,27 @@ pub const USER_MESH_ROW: u32 = 0x104;
 /// counts the records (a ring); records of [`TRACE_WORDS`] dwords follow from byte
 /// [`TRACE_FIRST`] on.
 pub const SLOT_TRACE: u8 = 252;
+/// The group buffer, the root UAV `u<SLOT_GROUPS>` in [`ROOT_CBV_SPACE`] (globally
+/// coherent): a console wave64 compute program run as host waves of 32 keeps the
+/// bookkeeping of that split (the counter handing out console lanes, the dwords two
+/// halves exchange through, their meeting counters) past its own LDS, in the group's
+/// shared memory. When the two together pass [`GROUP_SHARED_LIMIT`] the bookkeeping goes
+/// here instead, and the program's LDS keeps all of the group's shared memory.
+///
+/// [`GROUP_BOOK_SLOTS`] slots of [`GROUP_BOOK_STRIDE`] bytes, which the host makes
+/// zeroed and keeps for the process. A group picks its slot by its group id and holds it
+/// while it runs: dword 0 counts the group's threads still running (0: the slot is
+/// free), the bookkeeping follows from byte 4 (`lower.rs`, `Lower::book_slot`).
+pub const SLOT_GROUPS: u8 = 251;
+/// Slots of the [`SLOT_GROUPS`] buffer (a power of two).
+pub const GROUP_BOOK_SLOTS: u32 = 1 << 14;
+/// Bytes per slot of the [`SLOT_GROUPS`] buffer: the count and 63 dwords of bookkeeping (a
+/// group of 1,024 threads, 16 console waves, needs 49), two 128-byte lines.
+pub const GROUP_BOOK_STRIDE: u32 = 256;
+/// The host's group shared memory per compute thread group: D3D12's 32 KiB (shader model
+/// 6.10 and a driver that says more could lift it; `dxil.dll` 1.9 refuses a program over it,
+/// "Total Thread Group Shared Memory storage is ..., exceeded 32768").
+pub const GROUP_SHARED_LIMIT: u32 = 32 * 1024;
 /// `RootType::Other` codes of the user-data dwords a traced shader reads: what it
 /// traces ([`TRACE_PIXEL`] or [`TRACE_THREAD`], 0 nothing), then x, y and z of the
 /// pixel or the thread, the stamp each record carries (the frame), the tag (the draw),
@@ -375,7 +396,9 @@ impl Shader {
             217,
             &[bind, r, f],
         );
-        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        // (raw buffer, UAV; the group buffer globally coherent: a slot passes from group to group)
+        let coherent = if slot == SLOT_GROUPS { 0x4000 } else { 0 };
+        let h = self.annotate(block, h, 11 | 0x1000 | coherent, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -476,6 +499,14 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // One interpolation mode a row, before the signatures are declared
+        // (metadata, `PSV0`): what the next stage interpolates is a pixel
+        // shader's inputs, what a stage before it declares its outputs.
+        if self.pixel {
+            container::settle_row_modes(&mut self.inputs, true);
+        } else {
+            container::settle_row_modes(&mut self.outputs, false);
+        }
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
@@ -599,11 +630,15 @@ impl Shader {
                 let u = self.m.undef(p);
                 let no = self.m.bool(false);
                 let no = self.m.md_value(no);
+                let yes = self.m.bool(true);
+                let yes = self.m.md_value(yes);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
                     // Id, variable, name, space, lower bound, range size,
-                    // shape (11: raw buffer), globally coherent, counter,
-                    // rasterizer ordered, no extra properties.
+                    // shape (11: raw buffer), globally coherent (the group
+                    // buffer, as its handle says), counter, rasterizer
+                    // ordered, no extra properties.
+                    let coherent = if slot == SLOT_GROUPS { yes } else { no };
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
@@ -612,7 +647,7 @@ impl Shader {
                         Some(i32c(&mut self, u32::from(slot))),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
-                        Some(no),
+                        Some(coherent),
                         Some(no),
                         Some(no),
                         None,

@@ -935,7 +935,7 @@ impl HostHeap {
         };
         let make = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
             // SAFETY: plain heap creation.
-            unsafe {
+            let made = unsafe {
                 host.device
                     .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                         Type: kind,
@@ -943,7 +943,8 @@ impl HostHeap {
                         Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                         NodeMask: 0,
                     })
-            }
+            };
+            crate::apis::result(crate::apis::Api::DescriptorHeaps, if sampler { "a heap of samplers" } else { "a heap of views" }, made)
         };
         let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
@@ -973,6 +974,9 @@ impl HostHeap {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
                 tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                crate::apis::note(crate::apis::Api::DescriptorHeaps, || {
+                    format!("a view heap of {count} views is capped at the host's {size}: views past it read a null slot")
+                });
                 null - extra
             };
             match make(size) {
@@ -2229,6 +2233,17 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    // A constant buffer off the host's 256 bytes in its buffer's copy is
+    // shown on a copy of its own bytes ([`make`]): that copy is the one to
+    // bring up to date. (One on 256 bytes is its buffer's, as it was.)
+    if let &View::Constant(address, size) = view {
+        let len = u64::from(size);
+        let whole = crate::shadow::find(address, len)?;
+        if len == 0 || whole.gpu(address).is_multiple_of(256) {
+            return None;
+        }
+        return crate::shadow::exact(address, len).map(|own| (own, address, len));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -2822,14 +2837,32 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
+            let mut shadow = crate::shadow::find(address, u64::from(size))?;
+            let mut gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
-                return None;
+                // The host takes constant buffers on 256 bytes of a buffer
+                // only, the console anywhere: a copy of the view's own
+                // bytes, which starts on them (`shadow::exact`, as views
+                // off their buffer's elements get; `buffer_copy` names it
+                // to what brings a draw's views up to date). It was left
+                // null, and its shader read zeros.
+                let Some(own) = (size > 0).then(|| crate::shadow::exact(address, u64::from(size))).flatten() else {
+                    once!(
+                        address = format_args!("{address:#x}"),
+                        "constant buffer not 256-byte aligned on the host"
+                    );
+                    return None;
+                };
+                static OWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if OWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    tracing::info!(
+                        address = format_args!("{address:#x}"),
+                        size,
+                        "a constant buffer off the host's 256 bytes is shown on a copy of its own bytes"
+                    );
+                }
+                gpu = own.gpu(address);
+                shadow = own;
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,

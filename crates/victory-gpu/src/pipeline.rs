@@ -126,6 +126,82 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .clone()
 }
 
+/// `VICTORY_VALIDATE=1`: a translated shader is checked by `dxil.dll`'s
+/// validator (`VICTORY_DXIL`, else the newest Windows SDK's) the first
+/// time the run uses it, and one it rejects is logged with the validator's
+/// first error; the counts are the diagnostics' "DXIL validation" row.
+///
+/// The host does not do this: it takes a container by the hash we compute,
+/// and the driver compiles what is inside. Off by default: a check takes
+/// tens of milliseconds, of the thread that translates.
+#[cfg(windows)]
+fn validate(hash: &str, stage: &str, dxil: &[u8]) {
+    use victory_shader::emit::validator::Validator;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_VALIDATE").is_some_and(|v| v == "1")) {
+        return;
+    }
+    thread_local! {
+        /// This thread's validator; `None` inside if it does not load.
+        static VALIDATOR: std::cell::RefCell<Option<Option<Validator>>> = const { std::cell::RefCell::new(None) };
+    }
+    VALIDATOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let validator = slot.get_or_insert_with(|| match Validator::load(Validator::default_path().as_deref()) {
+            Ok(v) => {
+                static TOLD: std::sync::Once = std::sync::Once::new();
+                TOLD.call_once(|| match v.version() {
+                    Some((major, minor)) => tracing::info!("translated shaders are checked by dxil.dll's validator, version {major}.{minor}"),
+                    None => tracing::info!("translated shaders are checked by dxil.dll's validator (it does not say its version)"),
+                });
+                Some(v)
+            }
+            Err(e) => {
+                static TOLD: std::sync::Once = std::sync::Once::new();
+                TOLD.call_once(|| tracing::warn!(error = %e, "VICTORY_VALIDATE: no dxil.dll validator; shaders are not checked"));
+                None
+            }
+        });
+        let Some(validator) = validator else { return };
+        // A copy: the validator signs what it is given in place.
+        let mut copy = dxil.to_vec();
+        match validator.validate(&mut copy) {
+            Ok(()) => crate::apis::validated(true, String::new),
+            Err(text) => {
+                let first = text.lines().find(|l| l.contains("error")).or_else(|| text.lines().next()).unwrap_or("").trim().to_owned();
+                let profile = host_profile(dxil);
+                tracing::warn!(stage, hash, profile = profile.as_deref().unwrap_or("unknown"), error = %first, "shader failed DXIL validation (dxil.dll)");
+                crate::apis::validated(false, || format!("{stage} {hash}: {first}"));
+            }
+        }
+    });
+}
+
+/// The host profile of a translated shader (`cs_6_6`), from its DXIL part's
+/// program version: the kind the host runs it as, which is not always the
+/// console stage's (a vertex program can run as a mesh or geometry shader).
+/// Hydrate's records of the shader carry it (`victory_core::hydrate`).
+#[cfg(windows)]
+fn host_profile(container: &[u8]) -> Option<String> {
+    use victory_shader::{Container, FourCC};
+    let c = Container::parse(container).ok()?;
+    let version = u32::from_le_bytes(c.part(FourCC::DXIL)?.data.get(..4)?.try_into().ok()?);
+    // DXIL's shader kinds; the ray-tracing ones are libraries.
+    let kind = match version >> 16 {
+        0 => "ps",
+        1 => "vs",
+        2 => "gs",
+        3 => "hs",
+        4 => "ds",
+        5 => "cs",
+        6..=12 => "lib",
+        13 => "ms",
+        14 => "as",
+        _ => return None,
+    };
+    Some(format!("{kind}_{}_{}", version >> 4 & 0xf, version & 0xf))
+}
+
 /// A translated shader and the console resources its code reads.
 #[cfg(windows)]
 pub(crate) struct Translated {
@@ -159,10 +235,15 @@ impl Shader {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                crate::apis::seen(crate::apis::Api::Dxil, done.is_ok());
+                if let Ok(t) = &done {
+                    validate(&self.hash, self.stage, &t.host.dxil);
+                }
                 match &done {
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
+                        profile = host_profile(&t.host.dxil).as_deref().unwrap_or("unknown"),
                         user_data = t.host.user_data.len(),
                         samplers = t.host.samplers.len(),
                         "shader translated"
@@ -437,6 +518,12 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// Host pipelines the pipeline library gave, compiled in an earlier run.
+#[cfg(windows)]
+pub(crate) fn loaded() -> u64 {
+    library::LOADED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason

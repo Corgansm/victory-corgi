@@ -195,6 +195,8 @@ static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
+    #[cfg(feature = "diagnostics")]
+    crate::debugger::live::card(&command_key(op), us);
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
     let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
     e.0 += 1;

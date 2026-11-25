@@ -243,11 +243,14 @@ pub fn run(
     let paths = crate::default_paths(paths)?;
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
-        Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
+        let validator = Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
-            "validator    {}",
+            "validator    {} ({})",
             dll.as_ref()
-                .map_or("dxil.dll".into(), |p| p.display().to_string())
+                .map_or("dxil.dll".into(), |p| p.display().to_string()),
+            validator
+                .version()
+                .map_or("it does not say its version".into(), |(major, minor)| format!("validator version {major}.{minor}"))
         );
     }
     if pipelines {

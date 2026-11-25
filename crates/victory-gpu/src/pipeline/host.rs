@@ -507,7 +507,9 @@ impl HostPipeline {
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
                     let ours = if uav {
-                        slot == victory_shader::emit::SLOT_FAULTS || slot == victory_shader::emit::SLOT_TRACE
+                        slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::SLOT_TRACE
+                            || slot == victory_shader::emit::SLOT_GROUPS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
@@ -1227,7 +1229,8 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        let root = crate::apis::result(crate::apis::Api::RootSignatures, "a title pipeline's", device.CreateRootSignature(0, bytes))?;
+        Ok((root, bytes.to_vec()))
     }
 }
 

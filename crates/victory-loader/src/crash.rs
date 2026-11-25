@@ -52,11 +52,12 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
-            append_to_log(&format!(
-                "VIctory: panic on thread {:?}: {info}\n{}",
-                std::thread::current().name().unwrap_or("?"),
-                title_output()
-            ));
+            let thread = std::thread::current();
+            let thread = thread.name().unwrap_or("?");
+            // A panic is a crash for Hydrate's log (`VICTORY_HYDRATE_LOG`):
+            // where and why, as the unhandled exceptions are.
+            victory_core::hydrate::record_from_crash(&format!("VIctory: panic on thread {thread:?}: {info}"));
+            append_to_log(&format!("VIctory: panic on thread {thread:?}: {info}\n{}", title_output()));
         }));
     }
 }
@@ -489,6 +490,15 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     } else {
         String::new()
     };
+    // An unhandled exception is a crash for Hydrate's log
+    // (`VICTORY_HYDRATE_LOG`): its first line, before anything can fault.
+    if to_file {
+        victory_core::hydrate::record_from_crash(&format!(
+            "VIctory: {what} {:#010x} at {}{detail}",
+            code as u32,
+            locate(at)
+        ));
+    }
     // Printed line by line (a fault while unwinding must not lose the
     // lines before it), and kept for the file.
     let mut text = String::new();

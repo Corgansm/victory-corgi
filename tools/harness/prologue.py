@@ -15,7 +15,8 @@ How it works. VIctory (diagnostics builds) reads keys from `VICTORY_INPUT_FILE`:
 pressed when seen, with or without focus, on the keyboard and on the first pad. The pilot presses the
 configured keys (Enter = A by default) every few seconds until the window title reports a frame of the world
 (`<n> draws/frame` at or above `world_draws`) held for `settle` seconds. A run that stops moving (no log
-output, the same title, or a window that does not respond, for `stall` seconds), exits, or does not reach the
+output, the same title, or a window that does not respond, for `stall` seconds; or the same draws/frame
+for `same_draws` seconds: a loading screen that does not end), exits, or does not reach the
 world within `attempt_timeout` is killed and launched again, up to `restarts` times: a run stuck on a loading
 screen is restarted, not debugged.
 
@@ -85,13 +86,19 @@ PRESET_CACHE = {"lod": "cache-lod"}
 # Subtitles (A) -> Brightness (A) -> Finish Setup (A) -> Legal Notices (each notice read for a few
 # seconds: Down, Down, Down, A on Next) -> Legal Terms & Policies (A on each box, Down, A on Confirm;
 # the user said to accept them) -> loading -> cutscene (hold A) -> loading -> the world.
-# Enter and Down in turn walk all of those menus: Enter confirms where a screen has one button,
-# Down moves to the next row where it has several, and no screen on the way loses anything to a Down.
+# The setup screens come back on every launch (the run keeps no settings). The keys walk them blind,
+# in two passes that each start from a screen's top row (Up, Up): pass A confirms every row on the way
+# down (Enter, Down, Enter, Down, Enter), pass B the first and the last (Enter, Down, Down, Enter).
+# One button screens take any Enter; Legal Notices takes either pass once its notices' seconds are up;
+# the terms screen, whose two boxes Enter toggles and whose Confirm works only with both ticked, is
+# ticked and confirmed by A when it is reached untouched, and from any other state of the boxes by
+# A and B in turn within four passes (A alone would swap a half-ticked pair for ever: that was the run
+# of 03:05 on 2026-11-25, left on a greyed Confirm by Enter and Down in turn).
 ROUTES: dict[str, dict] = {
     "enter": {"keys": "Enter", "press_every": 4.0, "cutscene_draws": 0},
     "first-run": {
-        "keys": "Enter,Down",
-        "press_every": 2.0,
+        "keys": "Up,Up,Enter,Down,Enter,Down,Enter,Up,Up,Enter,Down,Down,Enter",
+        "press_every": 1.2,
         "cutscene_draws": 150,
         "cutscene_hold_ms": 8000,
         "cutscene_wait": 60.0,
@@ -261,6 +268,9 @@ class Settings:
     world_draws: int = 1500
     settle: float = 20.0
     stall: float = 240.0
+    # A loading screen that never ends still presents frames and writes its statistics to the log, so
+    # `stall` does not see it: the same draws/frame, under the world's, for this long is one too.
+    same_draws: float = 180.0
     attempt_timeout: float = 1800.0
     restarts: int = 3
     stop_pressing_in_world: bool = True
@@ -378,6 +388,8 @@ class Pilot(threading.Thread):
         r.phase = "menus" if cut else ""
         cut_since: Optional[float] = None
         phase_since = time.time()
+        last_draws: Optional[int] = None
+        draws_since = time.time()
         while not self._stop.is_set():
             time.sleep(1.0)
             now = time.time()
@@ -400,6 +412,8 @@ class Pilot(threading.Thread):
                     if w.draws is not None:
                         r.best_draws = max(r.best_draws, w.draws)
                 draws = w.draws if w else None
+                if draws != last_draws:
+                    last_draws, draws_since = draws, now
                 if cut and draws is not None:
                     if r.phase == "menus":
                         if draws >= cut:
@@ -449,6 +463,9 @@ class Pilot(threading.Thread):
                     reason = f"window not responding for {now - moved:.0f}s"
                 elif now - moved >= self.s.stall:
                     reason = f"no log output and the same title for {now - moved:.0f}s"
+                elif (self.s.same_draws and draws is not None and draws < self.s.world_draws
+                      and now - draws_since >= self.s.same_draws):
+                    reason = f"{draws} draws/frame for {now - draws_since:.0f}s (a loading screen that does not end)"
                 elif elapsed >= self.s.attempt_timeout:
                     reason = f"no world after {elapsed:.0f}s"
             if reason:
@@ -461,6 +478,7 @@ class Pilot(threading.Thread):
                     return
                 last_press, chord_at, last_size, last_title, moved = time.time(), 0, -1, "", time.time()
                 r.phase, cut_since, phase_since = ("menus" if cut else ""), None, time.time()
+                last_draws, draws_since = None, time.time()
         r.state = "stopped"
         r.note("stopped")
 
@@ -485,6 +503,8 @@ def main() -> int:
     ap.add_argument("--world-draws", type=int, default=1500)
     ap.add_argument("--settle", type=float, default=20.0)
     ap.add_argument("--stall", type=float, default=240.0)
+    ap.add_argument("--same-draws", type=float, default=180.0,
+                    help="seconds of the same draws/frame (under the world's) taken for a stuck loading screen; 0: off")
     ap.add_argument("--attempt-timeout", type=float, default=1800.0)
     ap.add_argument("--restarts", type=int, default=3)
     ap.add_argument("--watch-console", default="", help="a .cmd that follows the newest run log (opened per launch)")
@@ -507,6 +527,8 @@ def main() -> int:
         env.update(preset_env(a.preset))
         env["VICTORY_LOG"] = "info"
         env["VICTORY_INPUT_FILE"] = str(input_file)
+        # for Hydrate Shader Diagnostics (its application log): see victory_core::hydrate
+        env["VICTORY_HYDRATE_LOG"] = str(runs / "hydrate.jsonl")
         input_file.write_text("", encoding="ascii")
         handle = open(path, "wb")
         state["proc"] = subprocess.Popen(
@@ -541,7 +563,8 @@ def main() -> int:
         return state.get("attached") is not None and pid_alive(state["attached"])
 
     s = Settings.of_route(a.route, keys=a.keys, press_every=a.press_every, world_draws=a.world_draws,
-                          settle=a.settle, stall=a.stall, attempt_timeout=a.attempt_timeout, restarts=a.restarts)
+                          settle=a.settle, stall=a.stall, same_draws=a.same_draws,
+                          attempt_timeout=a.attempt_timeout, restarts=a.restarts)
     pilot = Pilot(s, input_file, launch, kill, alive, attach=attach)
     pilot.start()
     try:

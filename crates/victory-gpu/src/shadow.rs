@@ -1747,12 +1747,17 @@ fn back_piece(
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
-/// compared, changed runs put in, and their bytes.
-static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// compared, changed runs put in, and their bytes; then why a merge could
+/// not be done (each a settle of the flights, "title memory changed under
+/// shader writes"): the copy's memory is not write-watched, the write
+/// journal could not say what the title wrote, a page of a copy in the
+/// card's memory had more changed runs than were left, a copy had no
+/// bytes from before to merge into.
+static MERGED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// [`MERGED`], taken.
-pub(crate) fn merged_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
+pub(crate) fn merged_stats() -> [u64; 7] {
+    [0, 1, 2, 3, 4, 5, 6].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
@@ -2847,6 +2852,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            MERGED[3].fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let base = start / PAGE;
@@ -2859,6 +2865,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                MERGED[4].fetch_add(1, Ordering::Relaxed);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2894,6 +2901,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = join_runs(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
+                        MERGED[5].fetch_add(1, Ordering::Relaxed);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2905,6 +2913,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        MERGED[6].fetch_add(1, Ordering::Relaxed);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -3782,13 +3791,83 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     Some(shadow)
 }
 
-/// Copies of single buffer views' own bytes ([`exact`]), by (start,
-/// bytes), each with the asking that last took it; and the askings so far.
-#[allow(clippy::type_complexity)]
-static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+/// Copies of single buffer views' own bytes ([`exact`]): by (start,
+/// bytes), each with the asking that last took it; the askings so far; and
+/// how many the map holds when it is next looked over for idle ones.
+struct Exact {
+    tick: u64,
+    sweep_at: usize,
+    map: BTreeMap<(u64, u64), (Arc<Shadow>, u64)>,
+}
 
-/// Since the last frame line: askings for such copies, and copies made.
-static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static EXACT: Mutex<Exact> = Mutex::new(Exact { tick: 0, sweep_at: 0, map: BTreeMap::new() });
+
+/// Since the last frame line: askings for such copies, copies made, kept
+/// copies looked at for idle ones, looks, microseconds making copies, and
+/// copies made on a spare buffer ([`SPARES`]).
+static EXACT_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// The buffers of copies [`exact`] let go, mapped still, by size class
+/// ([`spare_class`]), for the next copies of their class; and their bytes.
+/// The world makes some 300 such copies a frame at new ring positions and
+/// lets as many go: the host took about 0.2 ms to make each buffer (60 ms
+/// a frame on the thread that records, 2026-11-25) and more to free it.
+static SPARES: Mutex<(u64, BTreeMap<u64, Vec<Spare>>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Bytes of spare buffers kept at most; past them a buffer let go is freed.
+const SPARE_BYTES: u64 = 256 << 20;
+
+/// A spare buffer and where it is mapped.
+struct Spare(ID3D12Resource, usize);
+
+// SAFETY: D3D12 resources are free-threaded, and the mapping is plain
+// memory nothing else uses while the buffer is spare.
+unsafe impl Send for Spare {}
+
+/// The size of the buffer an [`exact`] copy of `len` bytes is made on, so
+/// that a buffer let go fits the next copies of its class: whole 64 KiB
+/// (the host's least for a buffer of its own) up to 1 MiB, powers of two
+/// past it.
+fn spare_class(len: u64) -> u64 {
+    let len = len.max(1).next_multiple_of(256);
+    if len <= 1 << 20 { len.next_multiple_of(64 << 10) } else { len.next_power_of_two() }
+}
+
+/// Keeps the buffers of copies [`exact`] let go as spares, as far as
+/// [`SPARE_BYTES`] allows; called without [`EXACT`]'s lock. A copy nothing
+/// else holds (its list reset, no slot showing its buffer) gives its
+/// buffer up; the copy itself goes.
+fn keep_spares(gone: Vec<Arc<Shadow>>) {
+    let mut freed = Vec::new();
+    {
+        let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+        let (bytes, classes) = &mut *spares;
+        for shadow in gone {
+            let class = spare_class(shadow.len);
+            let Ok(shadow) = Arc::try_unwrap(shadow) else {
+                continue;
+            };
+            if *bytes + class > SPARE_BYTES {
+                freed.push(shadow);
+                continue;
+            }
+            *bytes += class;
+            classes.entry(class).or_default().push(Spare(shadow.buffer.clone(), shadow.data as usize));
+            freed.push(shadow);
+        }
+    }
+    // The copies, and the buffers no spare keeps, go outside the lock.
+    drop(freed);
+}
+
+/// A spare buffer of `class`, if one is kept.
+fn take_spare(class: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut spares = SPARES.lock().unwrap_or_else(|e| e.into_inner());
+    let (bytes, classes) = &mut *spares;
+    let Spare(buffer, data) = classes.get_mut(&class)?.pop()?;
+    *bytes -= class;
+    Some((buffer, data as *mut u8))
+}
 
 /// A copy of the title memory `[address, address + len)` that starts at
 /// `address` itself: for a buffer view whose bytes do not start on an
@@ -3807,8 +3886,8 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
+    /// Copies kept before the idle ones are first looked for, and the
+    /// askings an idle one stays for.
     const MANY: usize = 256;
     const LATELY: u64 = 512;
     if len == 0 {
@@ -3816,27 +3895,73 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    let now = *tick;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+    let exact = &mut *guard;
+    exact.tick += 1;
+    let now = exact.tick;
+    if let Some((shadow, used)) = exact.map.get_mut(&(address, len)) {
         *used = now;
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    // The idle ones go: held by the map alone (no list), their buffer by the
+    // copy alone (no slot shows it), and not asked for lately. Looked for
+    // once an eighth more copies than the last look left have come (at
+    // least `MANY`), not at every copy made past `MANY`: slots hold most
+    // copies (11,040 in the world), and the world makes some 200 a frame at
+    // new ring positions, so every making looked the whole map over, two
+    // million looks a frame, each asking a buffer for its references.
+    // The cheap questions come first.
+    let mut gone = Vec::new();
+    if exact.map.len() >= exact.sweep_at.max(MANY) {
+        let before = exact.map.len();
+        let idle: Vec<(u64, u64)> = exact
+            .map
+            .iter()
+            .filter(|(_, (shadow, used))| {
+                !(*used + LATELY > now || Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1)
+            })
+            .map(|(&key, _)| key)
+            .collect();
+        gone.extend(idle.iter().filter_map(|key| exact.map.remove(key)).map(|(shadow, _)| shadow));
+        exact.sweep_at = exact.map.len() + (exact.map.len() / 8).max(MANY);
+        EXACT_STATS[2].fetch_add(before as u64, Ordering::Relaxed);
+        EXACT_STATS[3].fetch_add(1, Ordering::Relaxed);
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    // Made without the lock: the host takes a while to make a buffer, and
+    // every recording thread that asks for a copy (found, nearly always)
+    // would wait behind it. On the buffer of one let go if there is one.
+    drop(guard);
+    let making = std::time::Instant::now();
+    keep_spares(gone);
+    let class = spare_class(len);
+    let made = match take_spare(class) {
+        Some(spare) => {
+            EXACT_STATS[5].fetch_add(1, Ordering::Relaxed);
+            Some(spare)
+        }
+        None => host().and_then(|host| host.shared_buffer(class)),
+    };
+    EXACT_STATS[4].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let (buffer, data) = made?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), now));
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let exact = &mut *guard;
+    exact.tick += 1;
+    let now = exact.tick;
+    // Another thread made the same copy meanwhile: that one is kept (a slot
+    // may show it already), and this one's buffer is a spare.
+    if let Some((kept, used)) = exact.map.get_mut(&(address, len)) {
+        *used = now;
+        kept.used.store(crate::host::moment(), Ordering::Relaxed);
+        let kept = kept.clone();
+        drop(guard);
+        keep_spares(vec![shadow]);
+        return Some(kept);
+    }
+    exact.map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
 }
@@ -3845,16 +3970,23 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, looked, looks, making_us, spared] =
+        [0, 1, 2, 3, 4, 5].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
-    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).map.len();
+    let spare_mb = SPARES.lock().unwrap_or_else(|e| e.into_inner()).0 >> 20;
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again): \
-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} on spare buffers; {:.1} ms making \
+         them), {kept} kept, {spare_mb} MB of spare buffers; {:.2} looks for idle ones per frame over {:.0} kept copies",
         asked as f64 / frames,
-        made as f64 / frames
+        made as f64 / frames,
+        spared as f64 / frames,
+        making_us as f64 / 1e3 / frames,
+        looks as f64 / frames,
+        looked as f64 / frames
     );
 }
 

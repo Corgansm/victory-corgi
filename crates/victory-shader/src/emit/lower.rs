@@ -184,6 +184,14 @@ fn half_shift(width: u32) -> u32 {
     if width == 16 { 0 } else { 15 - width }
 }
 
+/// Where a dword of the bookkeeping of a console wave64 program run as host waves of 32 is
+/// ([`Lower::book_at`]): a place in LDS, or the group buffer's handle and a byte offset.
+#[derive(Debug, Clone, Copy)]
+enum Book {
+    Lds(V),
+    Buffer(V, V),
+}
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -279,6 +287,15 @@ struct Lower<'a> {
     /// meet ([`Self::meet`]). A group barrier would wait for the group's other console waves,
     /// which take those branches their own way.
     pair_sync: Option<u32>,
+    /// The first dword of that bookkeeping ([`Self::halves`], [`Self::exchange`],
+    /// [`Self::pair_sync`]) in their numbering, the program's LDS dwords before it; and whether
+    /// it lives in a slot of the group buffer ([`super::shader::SLOT_GROUPS`]) instead of past
+    /// the program's LDS ([`group_book`]).
+    book_first: u32,
+    book_buffer: bool,
+    /// With `book_buffer`, once asked: the group buffer's handle and the byte offset of the
+    /// slot this group holds ([`Self::book_slot`]).
+    book_slot: Option<(V, V)>,
     /// [`with_trace`]: whether this program is traced, and once asked, the lane test, the
     /// stamp and tag, the ring's capacity and the trace UAV.
     trace_on: bool,
@@ -1183,6 +1200,52 @@ pub(super) fn pair_sync_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PAIR_SYNC").is_none_or(|v| v != "0"))
 }
 
+/// Where a console wave64 compute program run as host waves of 32 keeps the bookkeeping of
+/// that split ([`Lower::halves`], [`Lower::exchange`], [`Lower::pair_sync`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GroupBook {
+    /// Past the program's LDS while the two fit the host's group shared memory
+    /// ([`super::shader::GROUP_SHARED_LIMIT`]), else in the group buffer.
+    Auto,
+    /// Past the program's LDS always, as before: the validator refuses a program whose LDS
+    /// and bookkeeping pass the limit (the drivers seen so far take it).
+    Lds,
+    /// In the group buffer always: that path, tried on programs that fit.
+    Buffer,
+}
+
+/// `VICTORY_GROUP_BOOK=lds` or `=buffer` ([`GroupBook`]); `auto` when unset.
+pub(super) fn group_book() -> GroupBook {
+    #[cfg(test)]
+    if let Some(b) = TEST_GROUP_BOOK.get() {
+        return b;
+    }
+    static MODE: std::sync::OnceLock<GroupBook> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GROUP_BOOK").ok().as_deref().map(str::trim) {
+        Some("lds") => GroupBook::Lds,
+        Some("buffer") => GroupBook::Buffer,
+        _ => GroupBook::Auto,
+    })
+}
+
+/// Slots of the group buffer the translation picks from: [`super::shader::GROUP_BOOK_SLOTS`].
+fn group_book_slots() -> u32 {
+    #[cfg(test)]
+    if let Some(n) = TEST_GROUP_SLOTS.get() {
+        return n;
+    }
+    super::shader::GROUP_BOOK_SLOTS
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's [`group_book`], for its thread only.
+    pub(super) static TEST_GROUP_BOOK: std::cell::Cell<Option<GroupBook>> = const { std::cell::Cell::new(None) };
+    /// A test's [`group_book_slots`] (a power of two), for its thread only: one slot makes
+    /// every group of a dispatch wait for the one before.
+    pub(super) static TEST_GROUP_SLOTS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 fn own_bits_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
@@ -1445,11 +1508,15 @@ impl<'a> Lower<'a> {
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let mut pair_sync: Option<u32> = None;
+        // where that bookkeeping lives: its first dword, and whether in the group buffer
+        let mut book_first = 0u32;
+        let mut book_buffer = false;
         let mut split = 1u32;
         let mut console_threads = [1u32; 3];
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
+            book_first = s.lds_dwords;
             console_threads = cs.threads;
             // One console wave per host group ([`with_group_split`]).
             let size = cs.threads.iter().product::<u32>();
@@ -1598,6 +1665,36 @@ impl<'a> Lower<'a> {
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            // The bookkeeping of the split past the program's LDS, unless the two pass the
+            // host's group shared memory: then in a slot of the group buffer, and the program's
+            // LDS keeps all of it (`dxil.dll` refused compute 6b82bc7d22016cb5: its 32,768
+            // bytes of LDS and 196 of bookkeeping, 16 console waves of 64, were 32,964).
+            let book = s.lds_dwords - book_first;
+            if book > 0 {
+                let over = s.lds_dwords * 4 > super::shader::GROUP_SHARED_LIMIT;
+                let fits = 4 + book * 4 <= super::shader::GROUP_BOOK_STRIDE;
+                book_buffer = fits
+                    && match group_book() {
+                        GroupBook::Auto => over,
+                        GroupBook::Lds => false,
+                        GroupBook::Buffer => true,
+                    };
+                if book_buffer {
+                    s.lds_dwords = book_first;
+                }
+                if (over || book_buffer) && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                    eprintln!(
+                        "WAVE64-BOOK group={group} lds={} bookkeeping={}: {}",
+                        book_first * 4,
+                        book * 4,
+                        if book_buffer {
+                            "in the group buffer"
+                        } else {
+                            "past the LDS, over the host's group shared memory"
+                        }
+                    );
+                }
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -1757,6 +1854,9 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             pair_sync,
+            book_first,
+            book_buffer,
+            book_slot: None,
             split,
             console_threads,
             trace_on: TRACE.get(),
@@ -2488,6 +2588,8 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // (after everything else a block may still get at its end)
+        self.book_release();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -3925,11 +4027,10 @@ impl<'a> Lower<'a> {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        let lds = self.s.lds();
         let k = self.s.m.i32(slot);
-        let ptr = self.s.m.element(e, lds, k);
+        let counter = self.book_at(e, k);
         let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
+        self.book_store_at(e, counter, zero);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         if let Some(first) = self.pair_sync {
             // the arrival counters of `meet`, one per console wave: lane n of every host wave
@@ -3940,15 +4041,15 @@ impl<'a> Lower<'a> {
             let which = self.s.m.select(e, inside, lane, zero);
             let k = self.s.m.i32(first);
             let at = self.s.m.bin(e, Bin::Add, k, which);
-            let ptr = self.s.m.element(e, lds, at);
-            self.s.m.store(e, ptr, zero);
+            let at = self.book_at(e, at);
+            self.book_store_at(e, at, zero);
         }
         self.group_sync(e);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
         let add = self.s.m.select(e, first, k32, zero);
-        let ptr = self.s.m.element(e, lds, k);
-        let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+        let counter = self.book_at(e, k);
+        let old = self.book_rmw_at(e, Rmw::Add, counter, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
@@ -4009,9 +4110,10 @@ impl<'a> Lower<'a> {
         cl
     }
 
-    /// A group barrier with an LDS fence in `block`.
+    /// A group barrier with an LDS fence in `block` (and a UAV fence with the bookkeeping in
+    /// the group buffer, [`Self::book_fence`]).
     fn group_sync(&mut self, block: usize) {
-        let mode = self.s.m.i32(meeting_mode());
+        let mode = self.s.m.i32(meeting_mode() | self.book_fence());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
@@ -4038,14 +4140,13 @@ impl<'a> Lower<'a> {
         let wave = self.s.m.bin(block, Bin::LShr, thread, six);
         let k = self.s.m.i32(first);
         let at = self.s.m.bin(block, Bin::Add, k, wave);
-        let lds = self.s.lds();
-        let ptr = self.s.m.element(block, lds, at);
-        let fence = self.s.m.i32(8);
+        let ptr = self.book_at(block, at);
+        let fence = self.s.m.i32(8 | self.book_fence());
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
         let lead = self.s.op(block, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
         let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
         let add = self.s.m.select(block, lead, one, zero);
-        let old = self.s.m.atomic(block, Rmw::Add, ptr, add);
+        let old = self.book_rmw_at(block, Rmw::Add, ptr, add);
         let old = self.s.op(block, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         self.s.flags |= flags::WAVE_OPS;
         let odd = self.s.m.bin(block, Bin::Or, old, one);
@@ -4054,7 +4155,7 @@ impl<'a> Lower<'a> {
         let wait = self.s.m.new_block();
         let rest = self.s.m.split(block, wait);
         let looks = self.s.m.phi(wait, i32t);
-        let now = self.s.m.atomic(wait, Rmw::Or, ptr, zero);
+        let now = self.book_rmw_at(wait, Rmw::Or, ptr, zero);
         let ahead = self.s.m.bin(wait, Bin::Sub, now, target);
         let arrived = self.s.m.cmp(wait, pred::SGE, ahead, zero);
         let next = self.s.m.bin(wait, Bin::Add, looks, one);
@@ -4063,7 +4164,7 @@ impl<'a> Lower<'a> {
         let done = self.s.m.bin(wait, Bin::Or, arrived, late);
         self.s.m.set_phi_exact(looks, vec![(zero, head), (next, wait)]);
         self.s.m.terminate(wait, Term::CondBr(done, rest, wait));
-        let fence = self.s.m.i32(8);
+        let fence = self.s.m.i32(8 | self.book_fence());
         self.s.op(rest, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
     }
 
@@ -4093,16 +4194,15 @@ impl<'a> Lower<'a> {
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
-        let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
+        let ptr = self.book_at(at, index);
+        self.book_store_at(at, ptr, mine);
         self.meet(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
-        let p0 = self.s.m.element(at, lds, pair);
-        let p1 = self.s.m.element(at, lds, k1);
-        let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
+        let p0 = self.book_at(at, pair);
+        let p1 = self.book_at(at, k1);
+        let lo = self.book_load_at(at, p0);
+        let hi = self.book_load_at(at, p1);
         // the slots are written again only after every thread read them
         self.meet(at);
         (lo, hi)
@@ -4124,6 +4224,209 @@ impl<'a> Lower<'a> {
         let v = self.s.m.bin(e, Bin::Add, base, twice);
         self.pair = Some(v);
         v
+    }
+
+    /// The UAV fence the meetings of the split add with its bookkeeping in the group buffer:
+    /// device scope (2), since a slot passes from group to group; none in LDS.
+    fn book_fence(&self) -> u32 {
+        if self.book_buffer { 2 } else { 0 }
+    }
+
+    /// Where dword `index` of the split's bookkeeping is (numbered as in LDS, from
+    /// [`Self::book_first`]): its place in LDS, or the group buffer and a byte offset in this
+    /// group's slot. Made in `block`.
+    fn book_at(&mut self, block: usize, index: V) -> Book {
+        if !self.book_buffer {
+            let lds = self.s.lds();
+            return Book::Lds(self.s.m.element(block, lds, index));
+        }
+        let (h, slot) = self.book_slot();
+        let first = self.s.m.i32(self.book_first);
+        let dword = self.s.m.bin(block, Bin::Sub, index, first);
+        let two = self.s.m.i32(2);
+        let bytes = self.s.m.bin(block, Bin::Shl, dword, two);
+        let at = self.s.m.bin(block, Bin::Add, slot, bytes);
+        // (past the slot's count)
+        let four = self.s.m.i32(4);
+        Book::Buffer(h, self.s.m.bin(block, Bin::Add, at, four))
+    }
+
+    fn book_load_at(&mut self, block: usize, at: Book) -> V {
+        match at {
+            Book::Lds(ptr) => self.s.m.load(block, ptr),
+            Book::Buffer(h, byte) => {
+                let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+                let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
+                let r = self.s.op(block, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[h, byte, iu, mask, align]);
+                let x = self.s.m.extract(block, r, 0);
+                self.s.m.cast(block, Cast::Bitcast, x, i32t)
+            }
+        }
+    }
+
+    fn book_store_at(&mut self, block: usize, at: Book, value: V) {
+        match at {
+            Book::Lds(ptr) => self.s.m.store(block, ptr, value),
+            Book::Buffer(h, byte) => {
+                let (i32t, void) = (self.s.t.i32, self.s.t.void);
+                let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(1), self.s.m.i32(4));
+                self.s.op(
+                    block,
+                    "rawBufferStore.i32",
+                    Attr::NoUnwind,
+                    void,
+                    140,
+                    &[h, byte, iu, value, iu, iu, iu, mask, align],
+                );
+            }
+        }
+    }
+
+    /// An atomic operation on a bookkeeping dword; its old value.
+    fn book_rmw_at(&mut self, block: usize, op: Rmw, at: Book, value: V) -> V {
+        match at {
+            Book::Lds(ptr) => self.s.m.atomic(block, op, ptr, value),
+            Book::Buffer(h, byte) => {
+                // DXIL's atomic operations: add 0, and 1, or 2, xor 3, exchange 8.
+                let (code, value) = match op {
+                    Rmw::Add => (0, value),
+                    Rmw::Sub => {
+                        let zero = self.s.m.i32(0);
+                        (0, self.s.m.bin(block, Bin::Sub, zero, value))
+                    }
+                    Rmw::And => (1, value),
+                    Rmw::Or => (2, value),
+                    Rmw::Xor => (3, value),
+                    Rmw::Max => (4, value),
+                    Rmw::Min => (5, value),
+                    Rmw::UMin => (6, value),
+                    Rmw::UMax => (7, value),
+                    Rmw::Xchg => (8, value),
+                };
+                let i32t = self.s.t.i32;
+                let (iu, code) = (self.s.m.undef(i32t), self.s.m.i32(code));
+                self.s.op(block, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, code, byte, iu, iu, value])
+            }
+        }
+    }
+
+    /// The group buffer's handle and the byte offset of this group's slot in it, the first
+    /// time asked: made in the entry block, which every thread runs, before any bookkeeping.
+    ///
+    /// The slot is picked by the group id (every thread of the group finds the same one; a
+    /// number from the program's code shifts it, so programs that run at once start apart) and
+    /// held while any thread of the group runs: its first dword is 0 while the slot is free and
+    /// otherwise counts the holder's threads still running. Thread 0 takes it from 0 to the
+    /// group's size by a compare-exchange, waiting while another group whose id picks the same
+    /// slot holds it; the group meets; each thread gives its 1 back as it leaves
+    /// ([`Self::book_release`]), so the slot is free again once the last one has left. A group
+    /// that waits holds nothing and needs nothing of the group it waits for, which runs on,
+    /// so the wait ends. A wait that has not ended after 2^20 tries takes the slot anyway
+    /// (its count added to the holder's, which stays right): a slot left held by a broken
+    /// group costs wrong results, not the device.
+    fn book_slot(&mut self) -> (V, V) {
+        if let Some(s) = self.book_slot {
+            return s;
+        }
+        use super::shader::{GROUP_BOOK_STRIDE, SLOT_GROUPS};
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let h = self.s.root_uav_handle(SLOT_GROUPS);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let ids: Vec<V> = (0..3)
+            .map(|c| {
+                let c = k(self, c);
+                self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[c])
+            })
+            .collect();
+        // x, then y and z by primes: the groups of a row and of the rows near it fall in
+        // slots of their own
+        let (p1, p2) = (k(self, 1031), k(self, 7919));
+        let y = self.s.m.bin(e, Bin::Mul, ids[1], p1);
+        let z = self.s.m.bin(e, Bin::Mul, ids[2], p2);
+        let salt = self
+            .x
+            .native
+            .code
+            .iter()
+            .fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+        let salt = k(self, salt);
+        let mix = self.s.m.bin(e, Bin::Add, ids[0], y);
+        let mix = self.s.m.bin(e, Bin::Add, mix, z);
+        let mix = self.s.m.bin(e, Bin::Add, mix, salt);
+        let last = k(self, group_book_slots() - 1);
+        let slot = self.s.m.bin(e, Bin::And, mix, last);
+        let shift = k(self, GROUP_BOOK_STRIDE.trailing_zeros());
+        let base = self.s.m.bin(e, Bin::Shl, slot, shift);
+        // thread 0 takes the slot
+        let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let zero = k(self, 0);
+        let lead = self.s.m.cmp(e, pred::EQ, flat, zero);
+        let threads = k(self, self.s.threads.map_or(1, |t| t.iter().product::<u32>()));
+        let head = self.s.m.end_of(e);
+        let (spin, take) = (self.s.m.new_block(), self.s.m.new_block());
+        let rest = self.s.m.split_if(e, lead, spin);
+        let tries = self.s.m.phi(spin, i32t);
+        let iu = self.s.m.undef(i32t);
+        let old = self.s.op(
+            spin,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            i32t,
+            79,
+            &[h, base, iu, iu, zero, threads],
+        );
+        let got = self.s.m.cmp(spin, pred::EQ, old, zero);
+        let one = k(self, 1);
+        let next = self.s.m.bin(spin, Bin::Add, tries, one);
+        let limit = k(self, 1 << 20);
+        let late = self.s.m.cmp(spin, pred::IUGE, next, limit);
+        let done = self.s.m.bin(spin, Bin::Or, got, late);
+        self.s.m.set_phi_exact(tries, vec![(zero, head), (next, spin)]);
+        self.s.m.terminate(spin, Term::CondBr(done, take, spin));
+        // (taken late: the group's count joins the holder's)
+        let add = self.s.m.select(take, got, zero, threads);
+        let code = k(self, 0);
+        self.s
+            .op(take, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, code, base, iu, iu, add]);
+        self.s.m.terminate(take, Term::Br(rest));
+        self.book_slot = Some((h, base));
+        // every thread waits there for thread 0 to hold the slot
+        self.group_sync(e);
+        (h, base)
+    }
+
+    /// With the bookkeeping in the group buffer: before each `ret`, the thread gives its 1 of
+    /// the slot's count back ([`Self::book_slot`]): what it wrote there lands first (a device
+    /// fence), then the first lane of the host wave subtracts the lanes leaving with it.
+    fn book_release(&mut self) {
+        let Some((h, base)) = self.book_slot else {
+            return;
+        };
+        let (i1t, i32t, void) = (self.s.t.i1, self.s.t.i32, self.s.t.void);
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        for r in self.s.m.returns() {
+            let fence = self.s.m.i32(2);
+            self.s.op(r, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+            let here = self.s.m.bool(true);
+            let ballot = self.s.op(r, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
+            let mut leaving = self.s.m.i32(0);
+            for w in 0..4 {
+                let word = self.s.m.extract(r, ballot, w);
+                let n = self.s.op(r, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[word]);
+                leaving = self.s.m.bin(r, Bin::Add, leaving, n);
+            }
+            let lead = self.s.op(r, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+            let give = self.s.m.new_block();
+            let rest = self.s.m.split_if(r, lead, give);
+            let zero = self.s.m.i32(0);
+            let back = self.s.m.bin(give, Bin::Sub, zero, leaving);
+            let (iu, code) = (self.s.m.undef(i32t), self.s.m.i32(0));
+            self.s
+                .op(give, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, code, base, iu, iu, back]);
+            self.s.m.terminate(give, Term::Br(rest));
+        }
+        self.s.flags |= flags::WAVE_OPS;
     }
 
     /// The console's decision of the branch closing IR block `b`, which the wave takes
@@ -8031,14 +8334,13 @@ impl<'a> Lower<'a> {
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
                     let at = self.begin_guarded(Some(is));
-                    let lds = self.s.lds();
-                    let ptr = self.s.m.element(self.cur, lds, k);
-                    self.s.m.store(self.cur, ptr, a);
+                    let ptr = self.book_at(self.cur, k);
+                    self.book_store_at(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
                     let c2 = self.cur;
                     self.meet(c2);
-                    let ptr = self.s.m.element(c2, lds, k);
-                    let r = self.s.m.load(c2, ptr);
+                    let ptr = self.book_at(c2, k);
+                    let r = self.book_load_at(c2, ptr);
                     self.meet(c2);
                     return int(self, r);
                 }

@@ -405,7 +405,10 @@ fn worked() -> u64 {
 /// The thread that holds the submission lock stood waiting for the card
 /// from `since` until now ([`CARD_CLOCK_US`]).
 fn stood(since: std::time::Instant) {
-    CARD_CLOCK_US[2].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+    let us = since.elapsed().as_micros() as u64;
+    CARD_CLOCK_US[2].fetch_add(us, Ordering::Relaxed);
+    crate::apis::seen(crate::apis::Api::Queues, true);
+    crate::apis::took(crate::apis::Api::Queues, us);
 }
 
 /// What [`CARD_CLOCK_US`] is measured with.
@@ -638,10 +641,18 @@ fn create() -> windows::core::Result<Host> {
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::apis::result(
+                crate::apis::Api::CreateDevice,
+                "on the software adapter",
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device),
+            )?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            crate::apis::result(
+                crate::apis::Api::CreateDevice,
+                "on the default adapter",
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device),
+            )?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -695,23 +706,39 @@ fn create() -> windows::core::Result<Host> {
         };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
+        let rtvs: ID3D12DescriptorHeap = crate::apis::result(
+            crate::apis::Api::DescriptorHeaps,
+            "the heap of render target views",
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                 NumDescriptors: RTV_RING,
                 ..Default::default()
-            })?;
+            }),
+        )?;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
+        let dsvs: ID3D12DescriptorHeap = crate::apis::result(
+            crate::apis::Api::DescriptorHeaps,
+            "the heap of depth views",
             device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
                 NumDescriptors: RTV_RING,
                 ..Default::default()
-            })?;
+            }),
+        )?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        if let Some(desc) = adapter.as_ref().and_then(|a| a.GetDesc().ok()) {
+            let name = String::from_utf16_lossy(&desc.Description);
+            crate::apis::note(crate::apis::Api::CreateDevice, || {
+                format!(
+                    "the device is on {} ({} MB of its own memory)",
+                    name.trim_end_matches('\0'),
+                    desc.DedicatedVideoMemory >> 20
+                )
+            });
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -1097,7 +1124,11 @@ impl PlanePass {
         // SAFETY: the root signature is inside the pixel shader; the
         // description points at live data and never releases its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let root: ID3D12RootSignature = crate::apis::result(
+                crate::apis::Api::RootSignatures,
+                "the depth plane pass",
+                device.CreateRootSignature(0, &ps[..]),
+            )?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -2936,12 +2967,15 @@ fn late_helper() {
         };
         // The card first, without the submission lock: the submitting
         // thread prepares and sends meanwhile.
+        let waiting = std::time::Instant::now();
         // SAFETY: our fence and event.
         unsafe {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
                 WaitForSingleObject(event, INFINITE);
             }
         }
+        crate::apis::seen(crate::apis::Api::Queues, true);
+        crate::apis::took(crate::apis::Api::Queues, waiting.elapsed().as_micros() as u64);
         {
             let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
             // Something newer went up meanwhile: the card is waited for
@@ -3087,7 +3121,10 @@ fn relay_worker() {
                 if waited.is_err() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let us = waiting.elapsed().as_micros() as u64;
+                RELAY_STATS[2].fetch_add(us, Ordering::Relaxed);
+                crate::apis::seen(crate::apis::Api::Queues, waited.is_ok());
+                crate::apis::took(crate::apis::Api::Queues, us);
             }
         }
     }
@@ -3213,10 +3250,12 @@ fn late_line(frames: f64) {
         }
     }
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, unwatched, unsaid, over, unheld] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
+             {runs:.0} changed runs, {:.2} MB; merges that could not be done (a settle each): {unwatched:.1} of memory not \
+             write-watched, {unsaid:.1} the write journal could not say, {over:.1} over the changed runs left \
+             (VICTORY_LATE_MERGE_RUNS), {unheld:.1} of copies with no bytes from before",
             bytes / (1 << 20) as f64
         );
     }
@@ -3689,7 +3728,8 @@ impl Host {
         // shader.
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root: ID3D12RootSignature =
+                crate::apis::result(crate::apis::Api::RootSignatures, "a card compare", self.device.CreateRootSignature(0, bytes))?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -3751,7 +3791,8 @@ impl Host {
             // the shader.
             unsafe {
                 let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let root: ID3D12RootSignature =
+                    crate::apis::result(crate::apis::Api::RootSignatures, "a card compare", self.device.CreateRootSignature(0, bytes))?;
                 let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                     pRootSignature: std::mem::transmute_copy(&root),
                     CS: D3D12_SHADER_BYTECODE {
@@ -7240,11 +7281,18 @@ impl Meter {
             "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
         );
         {
-            let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let [texture_us, slots, making_us, finding_us, refreshing_us] =
+                [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let ms = |us: u64| us as f64 / 1e3 / frames;
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
-                texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is all of it): {:.1} ms making the \
+                 {:.0} buffer slots it looked at, {:.1} ms finding the host copy each shows, {:.1} ms bringing those copies up to \
+                 date (their spans; the copying itself is at submission), {:.1} ms in its pass over textures picked by index",
+                ms(making_us),
+                slots as f64 / frames,
+                ms(finding_us),
+                ms(refreshing_us),
+                ms(texture_us)
             );
         }
         crate::shadow::exact_line(frames);
@@ -7394,6 +7442,7 @@ impl Meter {
             }
             crate::watch::asks_say(frames);
             tracing::info!(
+                frame = crate::frame::current(),
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
@@ -7617,7 +7666,15 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let presenting = std::time::Instant::now();
+            let presented = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::apis::took(crate::apis::Api::Present, presenting.elapsed().as_micros() as u64);
+            if presented.is_ok() {
+                crate::apis::seen(crate::apis::Api::Present, true);
+            } else {
+                crate::apis::failed(crate::apis::Api::Present, || format!("Present answered {presented:?}"));
+            }
+            crate::apis::tick();
             // `VICTORY_PROFILE=<dir>`: a row per frame, taken around the
             // frame lines (which zero the counters it reads).
             #[cfg(feature = "diagnostics")]
@@ -7911,6 +7968,45 @@ impl Host {
             }
         }
     }
+}
+
+/// The group buffer (`victory_shader::emit::SLOT_GROUPS`), made the first time a
+/// pipeline binds it and kept for the process: `GROUP_BOOK_SLOTS` slots of
+/// `GROUP_BOOK_STRIDE` bytes (4 MiB) in the card's memory, zeroed when made, so
+/// every slot starts free. A console wave64 compute program run as host waves of
+/// 32 whose LDS leaves no room in the group's shared memory for that split's
+/// bookkeeping keeps it there; each group holds a slot while it runs and gives it
+/// back as its last thread leaves, so lists on any queue share the buffer and no
+/// state outlives a dispatch. Its GPU address.
+pub(crate) fn group_book() -> Option<u64> {
+    /// The buffer, held for the process.
+    struct Book(ID3D12Resource);
+    // SAFETY: a D3D12 resource is free-threaded; only its address is read.
+    unsafe impl Send for Book {}
+    static GPU: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static BOOK: Mutex<Option<Book>> = Mutex::new(None);
+    let gpu = GPU.load(Ordering::Acquire);
+    if gpu != 0 {
+        return Some(gpu);
+    }
+    let mut book = BOOK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(Book(buffer)) = &*book {
+        // SAFETY: a live buffer.
+        return Some(unsafe { buffer.GetGPUVirtualAddress() });
+    }
+    let bytes = u64::from(victory_shader::emit::GROUP_BOOK_SLOTS)
+        * u64::from(victory_shader::emit::GROUP_BOOK_STRIDE);
+    let buffer = host()?.uav_buffer(bytes)?;
+    name(&buffer, || "group bookkeeping of wave64 programs run as waves of 32".to_owned());
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    tracing::info!(
+        bytes,
+        "group buffer made: wave64 compute programs whose LDS leaves no room for the bookkeeping of their host waves of 32 keep it there"
+    );
+    *book = Some(Book(buffer));
+    GPU.store(gpu, Ordering::Release);
+    Some(gpu)
 }
 
 /// For adapters without device-removed data (the software one): the last

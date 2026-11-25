@@ -25,6 +25,11 @@
 //!   each console instruction wrote with its value, and the report shows it
 //!   next to the console disassembly ([`trace`]).
 //!
+//! - **Live view**: `live.html` in the folder, written every two seconds
+//!   while the title runs and reloading itself in a browser: where the
+//!   frame's time goes, and every pipeline's calls a frame with what
+//!   binding it costs the CPU (and, in a timing run, the card) ([`live`]).
+//!
 //! Without the keys: `command.txt` in the folder, read each frame and
 //! removed, one command a line: `capture`, `capture pick <x> <y>` (a
 //! fraction of the window, or pixels of it), `capture previews`,
@@ -36,6 +41,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
+pub(crate) mod live;
 mod overlay;
 pub(crate) mod pixel;
 mod report;
@@ -113,6 +119,7 @@ pub(crate) fn request(r: Request) {
 /// The overlay's text, made with the frame line (`crate::host`).
 pub(crate) fn stats(text: String) {
     if on() {
+        live::status(&text);
         overlay::set(text);
     }
 }
@@ -124,6 +131,7 @@ pub(crate) fn on_present(frame: u64) {
         return;
     }
     overlay::start_once();
+    live::tick();
     poll_keys();
     poll_commands();
     let recorded = RECORDING.load(Relaxed);

@@ -53,6 +53,9 @@ RENDERDOC_CMD = WORK / "renderdoc" / "RenderDoc_1.45_64" / "renderdoccmd.exe"
 TRIGGER_FILE = WORK / "trigger.txt"
 # Keys pressed from outside (VICTORY_INPUT_FILE, diag builds): `press()` and the prologue pilot append to it.
 INPUT_FILE = WORK / "input.txt"
+# The diagnostics VIctory writes for Hydrate Shader Diagnostics (VICTORY_HYDRATE_LOG): give Hydrate
+# this path as the application log and target\<profile>\victory.exe as the application.
+HYDRATE_LOG = RUNS / "hydrate.jsonl"
 
 logging.basicConfig(
     stream=sys.stderr,  # stdout carries the MCP protocol
@@ -512,6 +515,9 @@ def launch(
         INPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
         INPUT_FILE.write_text("", encoding="ascii")
         set_vars["VICTORY_INPUT_FILE"] = str(INPUT_FILE)
+        # What Hydrate Shader Diagnostics reads while it captures (its "application-written JSONL
+        # diagnostic log"): VIctory appends its shader, pipeline, binding, device and crash lines.
+        set_vars["VICTORY_HYDRATE_LOG"] = str(HYDRATE_LOG)
         if extra_env:
             set_vars.update({str(k): str(v) for k, v in extra_env.items()})
         for k in [k for k in env if k.startswith("VICTORY_")]:

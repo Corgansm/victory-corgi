@@ -109,9 +109,29 @@ pub extern "system" fn LoadLibraryExA(
     if !name.is_null()
         && let Some(handle) = find_module(&narrow(name), runs_code(flags))
     {
+        loaded(|| narrow(name), "ours or the title's", true);
         return handle;
     }
-    host::load_library_ex_a(name, file, flags)
+    let handle = host::load_library_ex_a(name, file, flags);
+    if !name.is_null() {
+        loaded(|| narrow(name), "the host's", !handle.is_null());
+    }
+    handle
+}
+
+/// The title loaded a library (or did not): counted for the diagnostics'
+/// row of runtime library dependencies, each name told once. The title's
+/// last error is left as the load set it.
+fn loaded(name: impl FnOnce() -> String, whose: &str, ok: bool) {
+    use victory_gpu::apis::{Api, failed, note, seen};
+    let error = host::last_error();
+    if ok {
+        seen(Api::LoadLibrary, true);
+        note(Api::LoadLibrary, || format!("{} ({whose})", name()));
+    } else {
+        failed(Api::LoadLibrary, || format!("FAILED {} (error {error})", name()));
+    }
+    host::set_last_error(error);
 }
 
 /// See [`LoadLibraryExA`].
@@ -123,9 +143,14 @@ pub extern "system" fn LoadLibraryExW(
     if !name.is_null()
         && let Some(handle) = find_module(&wide(name), runs_code(flags))
     {
+        loaded(|| wide(name), "ours or the title's", true);
         return handle;
     }
-    host::load_library_ex_w(name, file, flags)
+    let handle = host::load_library_ex_w(name, file, flags);
+    if !name.is_null() {
+        loaded(|| wide(name), "the host's", !handle.is_null());
+    }
+    handle
 }
 
 /// False for loads as data or resources (`DONT_RESOLVE_DLL_REFERENCES`,
@@ -144,8 +169,47 @@ pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
 }
 
 /// Looks up our implementations behind a pseudo handle; real modules go to
-/// the host.
+/// the host. Counted for the diagnostics' row of dynamically resolved
+/// dependencies; a name that is not found is told there once.
 pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+    use victory_gpu::apis::{Api, failed, seen};
+    let found = get_proc_address(module, name);
+    if !found.is_null() {
+        seen(Api::GetProcAddress, true);
+        return found;
+    }
+    // The title's last error is left as the lookup set it.
+    let error = host::last_error();
+    failed(Api::GetProcAddress, || {
+        let symbol = if (name as usize) < 0x1_0000 { format!("#{}", name as usize) } else { narrow(name) };
+        format!("{}!{symbol} (error {error})", module_name(module))
+    });
+    host::set_last_error(error);
+    found
+}
+
+/// The file name of a module the title names by handle: one of ours, one
+/// of the title's images, or the host's.
+fn module_name(module: *mut c_void) -> String {
+    if let Some(m) = registry().iter().find(|m| handle(m) == module) {
+        return m.name.to_owned();
+    }
+    let path = match title_path(module) {
+        Some(path) => path,
+        None => {
+            let mut path = [0u16; 260];
+            let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
+            String::from_utf16_lossy(&path[..len.min(path.len())])
+        }
+    };
+    match path.rsplit(['\\', '/']).next() {
+        Some(file) if !file.is_empty() => file.to_owned(),
+        _ => format!("{module:p}"),
+    }
+}
+
+/// See [`GetProcAddress`].
+fn get_proc_address(module: *mut c_void, name: *const u8) -> *mut c_void {
     // `NULL` is the process's exe, which for the title is its own image.
     let module = if module.is_null() {
         runtime::main_image().unwrap_or(0) as *mut c_void
@@ -439,6 +503,11 @@ mod host {
         unsafe { SetLastError(code) }
     }
 
+    pub(super) fn last_error() -> u32 {
+        // SAFETY: see above.
+        unsafe { windows_sys::Win32::Foundation::GetLastError() }
+    }
+
     pub(super) fn load_library_ex_a(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void {
         // SAFETY: see above.
         unsafe { LoadLibraryExA(name, file, flags) }
@@ -552,6 +621,10 @@ mod host {
     }
 
     pub(super) fn set_last_error(_: u32) {}
+
+    pub(super) fn last_error() -> u32 {
+        0
+    }
 
     pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()

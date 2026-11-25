@@ -531,3 +531,150 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// `native` with `bytes` of LDS per group (512-byte granules in `COMPUTE_PGM_RSRC2`).
+fn with_lds(mut native: NativeProgram, bytes: u32) -> NativeProgram {
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 = (cs.rsrc2 & !(0x1FF << 15)) | ((bytes / 512) << 15);
+    }
+    native
+}
+
+/// [`lowered`] with the bookkeeping of the split where `book` says, from `slots` slots.
+fn lowered_book(
+    native: &NativeProgram,
+    wide: &HashSet<usize>,
+    book: lower::GroupBook,
+    slots: Option<u32>,
+) -> Result<HostShader, ShaderError> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let was = (lower::TEST_GROUP_BOOK.replace(Some(book)), lower::TEST_GROUP_SLOTS.replace(slots));
+    let shader = lowered(native, &p, wide);
+    lower::TEST_GROUP_BOOK.set(was.0);
+    lower::TEST_GROUP_SLOTS.set(was.1);
+    shader
+}
+
+/// The wave OR of [`program`] with its branch taken wave-wide.
+fn wave_or(native: &NativeProgram) -> HashSet<usize> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let branch = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+        .expect("the branch");
+    HashSet::from([branch])
+}
+
+/// Runs the wave OR of [`program`] on the hardware device with the group buffer bound
+/// (`slots` slots): for each count of threads in the branch, what dword 0 of the UAV holds
+/// and every slot's count afterwards. None (and a line) without a device that takes it.
+fn wave_or_on_the_card(
+    shader: &HostShader,
+    groups: [u32; 3],
+    slots: u32,
+) -> Option<Vec<(u32, u32, Vec<u32>)>> {
+    use super::shader::{GROUP_BOOK_STRIDE, SLOT_GROUPS};
+    // (user data is parameter 0; the group buffer the only root view after it)
+    assert!(shader.root_cbvs.is_empty() && shader.root_srvs.is_empty());
+    assert_eq!(shader.root_uavs, vec![SLOT_GROUPS]);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return None;
+        }
+    };
+    let words = slots * GROUP_BOOK_STRIDE / 4;
+    let mut runs = Vec::new();
+    for (below, expected) in [(64u32, u32::MAX), (40, 0x000F_FFFF), (33, 0x0001_FFFF), (10, 0x1F), (1, 1)] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud)), (1, Root::Uav(words))],
+                    views: &[View::RawUav(1)],
+                    samplers: &[],
+                    groups,
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let counts = out[1].iter().step_by((GROUP_BOOK_STRIDE / 4) as usize).copied().collect();
+        runs.push((out[0][0], expected, counts));
+    }
+    Some(runs)
+}
+
+/// A console wave64 program whose LDS fills the host group's 32 KiB, run as host waves of
+/// 32 that exchange: the split's bookkeeping does not fit past the LDS any more (compute
+/// 6b82bc7d22016cb5 of the title: 32,768 + 196 bytes, which `dxil.dll` refuses). It goes to
+/// the group buffer instead, the program keeps its LDS whole, and the OR over both halves
+/// comes out as before; the slot is free again afterwards.
+#[test]
+fn a_program_whose_lds_fills_the_groups_shared_memory_keeps_its_bookkeeping_in_the_group_buffer() {
+    use super::shader::SLOT_GROUPS;
+    let native = with_lds(program(0xBF88_0000), 32 * 1024);
+    let wide = wave_or(&native);
+    // as before: past the LDS, 12 bytes over the limit
+    let past = lowered_book(&native, &wide, lower::GroupBook::Lds, None).expect("lower");
+    assert!(past.root_uavs.is_empty());
+    // by default, in the group buffer
+    let shader = lowered_book(&native, &wide, lower::GroupBook::Auto, None).expect("lower");
+    assert_eq!(shader.root_uavs, vec![SLOT_GROUPS]);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = past.dxil.clone();
+        let refused = v.validate(&mut copy).expect_err("32 KiB of LDS and the bookkeeping past it");
+        assert!(refused.contains("exceeded 32768"), "{refused}");
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let slots = super::shader::GROUP_BOOK_SLOTS;
+    let Some(runs) = wave_or_on_the_card(&shader, [8, 4, 2], slots) else { return };
+    for (got, expected, counts) in runs {
+        assert_eq!(got, expected);
+        assert!(counts.iter().all(|&c| c == 0), "a slot still held: {:?}", counts.iter().filter(|&&c| c != 0).count());
+    }
+    eprintln!("ran on the hardware device: the OR of both halves with the bookkeeping in the group buffer");
+}
+
+/// Every group of a dispatch picks the one slot there is: each takes it in turn (thread 0
+/// waits while another group holds it) and gives it back as its last thread leaves, so
+/// every group's OR is right and the slot ends free.
+#[test]
+fn groups_that_pick_one_slot_of_the_group_buffer_take_turns() {
+    let native = program(0xBF88_0000);
+    let wide = wave_or(&native);
+    let shader = lowered_book(&native, &wide, lower::GroupBook::Buffer, Some(1)).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let Some(runs) = wave_or_on_the_card(&shader, [256, 1, 1], 1) else { return };
+    for (got, expected, counts) in runs {
+        assert_eq!(got, expected);
+        assert_eq!(counts, vec![0], "the one slot is still held");
+    }
+    eprintln!("ran on the hardware device: 256 groups took turns in one slot");
+}
+
+/// A program that fits translates as before whatever the group buffer could hold: the same
+/// bytes with the bookkeeping past the LDS by default and by `VICTORY_GROUP_BOOK=lds`.
+#[test]
+fn a_program_that_fits_keeps_its_bookkeeping_past_its_lds() {
+    let native = with_lds(program(0xBF88_0000), 16 * 1024);
+    let wide = wave_or(&native);
+    let auto = lowered_book(&native, &wide, lower::GroupBook::Auto, None).expect("lower");
+    let lds = lowered_book(&native, &wide, lower::GroupBook::Lds, None).expect("lower");
+    assert!(auto.root_uavs.is_empty());
+    assert_eq!(auto.dxil, lds.dxil);
+}

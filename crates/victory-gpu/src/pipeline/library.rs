@@ -522,7 +522,7 @@ pub(crate) fn pipeline(
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return create();
+        return crate::apis::result(crate::apis::Api::PipelineStates, name, create());
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -537,6 +537,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            crate::apis::seen(crate::apis::Api::PipelineStates, true);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -548,7 +549,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        create()?
+        crate::apis::result(crate::apis::Api::PipelineStates, name, create())?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {

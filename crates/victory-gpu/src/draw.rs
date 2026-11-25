@@ -553,8 +553,11 @@ pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
-/// slots the pass over buffer views looked at; since the last frame line.
-pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// slots the pass over buffer views looked at; then the microseconds of the
+/// buffer pass's parts: making the slots (`mirror`), finding the host copy
+/// each shows (`buffer_copy`), and bringing the copies up to date (the
+/// spans and their refreshes); since the last frame line.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1193,6 +1196,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // The debugger's live view: this pipeline's calls and what binding it costs.
+        #[cfg(feature = "diagnostics")]
+        let _live = crate::debugger::live::bind(&p.name, compute, p.root.as_raw() as usize, p.pso.as_raw() as usize);
         // Depth planes compute wrote in this list through their twins: given to the planes
         // first, so this draw or dispatch reads (or tests) what was written. The passes set
         // state of ours: the title's is set again, and what follows sets the pipeline, root
@@ -1450,6 +1456,24 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_GROUPS {
+                    // Ours: the slots where the groups of a console wave64 program run as
+                    // host waves of 32 keep that split's bookkeeping, which the program's
+                    // LDS leaves no room for in the group's shared memory.
+                    let Some(groups) = crate::host::group_book() else {
+                        once!("a shader that keeps its groups' bookkeeping in the group buffer, without that buffer: dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the buffer lives as long as the process.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, groups);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, groups);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_TRACE {
                     // Ours: a traced shader's ring of records (`crate::debugger::trace`).
                     #[cfg(feature = "diagnostics")]
@@ -1780,12 +1804,18 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        // Nanoseconds making slots and finding their copies (the parts).
+        let (mut making_ns, mut finding_ns) = (0u64, 0u64);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            let made_at = std::time::Instant::now();
+            let view = host.mirror(index, handle, true);
+            let made = std::time::Instant::now();
+            making_ns += made.duration_since(made_at).as_nanos() as u64;
+            let Some(view) = view else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1805,7 +1835,9 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let found = crate::descriptor::host::buffer_copy(&view);
+            finding_ns += made.elapsed().as_nanos() as u64;
+            let Some((shadow, address, len)) = found else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
@@ -1814,6 +1846,9 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        HEAP_PASS_PARTS[2].fetch_add(making_ns / 1000, Ordering::Relaxed);
+        HEAP_PASS_PARTS[3].fetch_add(finding_ns / 1000, Ordering::Relaxed);
+        let refreshing = std::time::Instant::now();
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
@@ -1858,6 +1893,7 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        HEAP_PASS_PARTS[4].fetch_add(refreshing.elapsed().as_micros() as u64, Ordering::Relaxed);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -3984,8 +4020,23 @@ fn describe(view: Option<&View>) -> String {
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        Some(v @ View::Shader(r, desc)) => texture(*r as This).unwrap_or_else(|| {
+            match crate::descriptor::host::buffer_range(v) {
+                Some(range) => format!("buffer {:?}", Some(range)),
+                // No host texture and no buffer memory: the title's null view, or a view of a
+                // resource the host has nothing for (which reads zeros where the console reads
+                // the resource). Told apart by the resource and the view's words.
+                None if *r == 0 => "buffer None (a null view)".into(),
+                None => format!(
+                    "buffer None (resource {r:#x}: {}; view {:?})",
+                    match crate::resource::texture_memory(*r as This) {
+                        Some((_, d)) => format!("a texture with no host copy, {d:?}"),
+                        None => "no texture and no buffer memory".into(),
+                    },
+                    desc.as_ref().map(|d| &d[..6])
+                ),
+            }
+        }),
         Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
             Some(t) => format!("uav texture {t}"),
             None => format!(
