@@ -194,6 +194,8 @@ pub(crate) struct State {
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
     stencil: Option<u32>,
+    /// The title's depth bounds `(min, max)`, for the host list (`depth_bounds`).
+    depth_bounds: Option<(f32, f32)>,
     /// The indirect records clamped last, if later draws may still read
     /// them ([`windows`]).
     window: Option<Window>,
@@ -620,6 +622,11 @@ impl State {
         crate::draw::stencil_ref(list, reference);
     }
 
+    pub(crate) fn set_depth_bounds(&mut self, list: &HostList, min: f32, max: f32) {
+        self.depth_bounds = Some((min, max));
+        crate::draw::depth_bounds(list, min, max);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -655,6 +662,9 @@ impl State {
         }
         if let Some(reference) = self.stencil {
             crate::draw::stencil_ref(list, reference);
+        }
+        if let Some((min, max)) = self.depth_bounds {
+            crate::draw::depth_bounds(list, min, max);
         }
     }
 
@@ -2745,6 +2755,15 @@ pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetBlendFactor(factor) };
+}
+
+/// The depth bounds the title set, for host pipelines with the test
+/// (`pipeline::host`); none where the host list has no `OMSetDepthBounds`.
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list.
+        unsafe { l1.OMSetDepthBounds(min, max) };
+    }
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {

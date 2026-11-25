@@ -461,6 +461,35 @@ pub fn emit(
                 }
             }
         }
+        // Last resort, since the host refuses `WaveSize(64)`: LDS read and written inside one
+        // lane-branch region without a barrier there ([`lower::with_loose_lds`]), first as
+        // the program is, then in its other forms, then with each host wave on its own.
+        // (`VICTORY_WAVE_LOOSE_LDS=0` turns it off.)
+        if !strict && std::env::var_os("VICTORY_WAVE_LOOSE_LDS").is_none_or(|v| v != "0") {
+            let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+            report("LDS without barriers in lane branches (APPROXIMATE)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f {
+                    let again = lower::with_loose_lds(|| emit_program(c, native, p, st, io, res));
+                    report(&format!("LDS without barriers in lane branches (APPROXIMATE), {name}"), &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
+            }
+            if local_on && !exact_only {
+                let local = lower::with_loose_lds(|| {
+                    lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res))
+                });
+                report("LDS without barriers in lane branches, local waves (APPROXIMATE, any mask)", &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the

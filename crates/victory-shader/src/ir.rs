@@ -214,6 +214,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             });
         }
     }
+    merge_section_tails(&mut blocks);
     link(&mut blocks);
     if !blocks[0].preds.is_empty() {
         return Err(ShaderError::Unsupported {
@@ -224,6 +225,97 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     split_irreducible(&mut blocks)?;
 
     Ok(rename(blocks, wave64, vgprs))
+}
+
+/// Whole-wave sections that end in a block they do not start in, made to end in their own.
+///
+/// The console compiler can open a whole-wave section (`s_or_saveexec -1`, see
+/// `emit::wave`) on each side of an `if`, e.g. a wave maximum on one side and a
+/// minimum on the other, and leave both to a shared tail that reads lane 0
+/// (`v_readlane_b32 s8, v2, 0`) and restores EXEC. A section is simulated within
+/// one block, so the tail's instructions up to and including the restore are
+/// copied into the end of every predecessor (before its `s_branch`, if it has
+/// one), each of which then holds a whole section, and the predecessors jump
+/// past them to the rest of the tail. Done only where every predecessor of the
+/// tail reaches it by a jump or by falling through and opened a section,
+/// saving EXEC into the register the tail restores it from.
+fn merge_section_tails(blocks: &mut [Block]) {
+    let sop = |inst: &Inst| match &inst.fields {
+        Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            ..
+        } => Some((*code, src.first().cloned())),
+        _ => None,
+    };
+    // The register a block's last instruction that makes EXEC every lane saved it
+    // into, if no instruction after it in the block writes EXEC.
+    let open = |block: &Block| -> Option<u8> {
+        let i = block
+            .insts
+            .iter()
+            .rposition(|inst| sop(inst).is_some_and(|(code, _)| code == EXEC));
+        let at = block.insts.iter().rposition(|inst| {
+            let name = inst.name();
+            let all = match name {
+                "s_or_saveexec_b64" | "s_or_saveexec_b32" => Some(Operand::Const(193)),
+                "s_nand_saveexec_b64" | "s_nand_saveexec_b32" => Some(Operand::Const(128)),
+                _ => None,
+            };
+            all.is_some()
+                && matches!(&inst.fields, Fields::Sop { src, .. } if src.first() == all.as_ref())
+        })?;
+        // Nothing after the start writes EXEC (`s_*_saveexec` writes its
+        // destination, the saved mask; EXEC is written by moves to it).
+        if i.is_some_and(|i| i > at) {
+            return None;
+        }
+        sop(&block.insts[at]).map(|(code, _)| code)
+    };
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+    for (b, block) in blocks.iter().enumerate() {
+        for s in block.exit.successors() {
+            preds[s].push(b);
+        }
+    }
+    for tail in 0..blocks.len() {
+        let from = &preds[tail];
+        if from.is_empty() || from.contains(&tail) {
+            continue;
+        }
+        // The tail's restore: a move to EXEC from a scalar register.
+        let Some((restore, saved)) = blocks[tail].insts.iter().enumerate().find_map(|(i, inst)| {
+            let (code, src) = sop(inst)?;
+            let moves = matches!(inst.name(), "s_mov_b64" | "s_mov_b32");
+            match src {
+                Some(Operand::Scalar { code: s, .. }) if code == EXEC && moves => Some((i, s)),
+                _ => None,
+            }
+        }) else {
+            continue;
+        };
+        // Nothing before the restore in the tail touches EXEC otherwise.
+        if blocks[tail].insts[..restore]
+            .iter()
+            .any(|inst| sop(inst).is_some_and(|(code, _)| code == EXEC || code == saved))
+        {
+            continue;
+        }
+        let all = from.iter().all(|&p| {
+            matches!(blocks[p].exit, Exit::Jump(t) if t == tail) && open(&blocks[p]) == Some(saved)
+        });
+        if !all {
+            continue;
+        }
+        let head: Vec<Inst> = blocks[tail].insts.drain(..=restore).collect();
+        for &p in from {
+            let insts = &mut blocks[p].insts;
+            let branch = insts.last().is_some_and(|i| i.name() == "s_branch");
+            let last = if branch { insts.pop() } else { None };
+            insts.extend(head.iter().cloned());
+            insts.extend(last);
+        }
+    }
 }
 
 /// Scalar registers the compiler parked in lanes of a VGPR, as scalar moves.

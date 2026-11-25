@@ -416,13 +416,27 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
-        tracing::warn!(
-            slot = format_args!("{:#x}", SLOT),
-            calls,
-            description = format_args!("{description:x?}"),
-            first_points_at = format_args!("{first:x?}"),
-            "a pipeline creation method that is not implemented: the title goes without this pipeline"
-        );
+        if SLOT == 0x1c8 {
+            // Only the title's pipelines made ahead of use: on failure the job at
+            // title+0x24774c0 leaves the entry out of its table and goes on (the HRESULT
+            // check after the call, title+0x4e9b660, stops only on device-removed codes),
+            // and the pipeline is made by the usual methods when it is first drawn with
+            // (Ghidra, 2026-11-24). Nothing is missing on screen, so this is no warning.
+            tracing::info!(
+                calls,
+                description = format_args!("{description:x?}"),
+                first_points_at = format_args!("{first:x?}"),
+                "a pipeline made ahead of use (device 0x1c8) is left to the title's usual creation when drawn"
+            );
+        } else {
+            tracing::warn!(
+                slot = format_args!("{:#x}", SLOT),
+                calls,
+                description = format_args!("{description:x?}"),
+                first_points_at = format_args!("{first:x?}"),
+                "a pipeline creation method that is not implemented: the title goes without this pipeline"
+            );
+        }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     pipeline_dump::call(SLOT, calls, desc);
