@@ -1671,26 +1671,63 @@ fn host_texture(
         }
         value
     });
-    let heap = D3D12_HEAP_PROPERTIES {
+    // A texture the title fills and shaders only sample goes in the PC's
+    // memory when the card has no room ([`system_textures`]): read over
+    // the bus, but there, where it was not made at all and its materials
+    // drew black.
+    let system = fills(desc) && system_textures() && !room();
+    let card = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let pc = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_CUSTOM,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        ..Default::default()
     };
+    let create = |heap: &D3D12_HEAP_PROPERTIES, texture: &mut Option<ID3D12Resource>| {
+        // SAFETY: the description has the host layout (checked size, same
+        // fields); the out pointer is ours.
+        unsafe {
+            host.device.CreateCommittedResource(
+                heap,
+                D3D12_HEAP_FLAG_NONE,
+                (&raw const d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                ),
+                // The same layout: format, then color or depth and stencil.
+                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
+                texture,
+            )
+        }
+    };
+    let mut texture: Option<ID3D12Resource> = None;
+    let mut made = Err(windows::core::Error::empty());
+    if system {
+        made = create(&pc, &mut texture);
+        match &made {
+            Ok(()) => {
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if SYSTEM_TEXTURES.fetch_add(1, Relaxed) == 0 && !SAID.swap(true, Relaxed) {
+                    tracing::info!("textures the title fills: the card has no room, so they are made in the PC's memory");
+                }
+            }
+            Err(e) => {
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                static SAID: AtomicBool = AtomicBool::new(false);
+                if !SAID.swap(true, Relaxed) {
+                    tracing::warn!(error = %e, desc = ?d, "textures the title fills: the PC's memory refused one; made on the card");
+                }
+                texture = None;
+            }
+        }
+    }
+    if made.is_err() {
+        made = create(&card, &mut texture);
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
@@ -1700,6 +1737,21 @@ fn host_texture(
         });
     }
     texture
+}
+
+/// Host textures made in the PC's memory because the card had no room
+/// ([`host_texture`]).
+pub(crate) static SYSTEM_TEXTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether textures the title fills go in the PC's memory when the card has
+/// no room ([`room`]), rather than not being made (`VICTORY_SYSTEM_TEXTURES=0`:
+/// not made, as before). Without them, textures picked by index waited
+/// while the system's budget for the card shrank under other programs'
+/// use (11.9 GB to 6.8 GB in run 20261124-161527: 13,000 waiting, uploads
+/// stopped, walls and people drawn black).
+pub(crate) fn system_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYSTEM_TEXTURES").is_none_or(|v| v != "0"))
 }
 
 /// A texture's console memory and description; `None` for buffers.

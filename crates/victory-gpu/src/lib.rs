@@ -38,6 +38,8 @@ pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod pix;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 pub mod query;
@@ -53,6 +55,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+#[cfg(windows)]
+mod texdebug;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

@@ -1584,9 +1584,10 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
-            // From here on a host texture is made: not without room. The
-            // slot stays due.
-            if !room {
+            // From here on a host texture is made: not without room (on the
+            // card, or in the PC's memory, `resource::system_textures`).
+            // The slot stays due.
+            if !room && !crate::resource::system_textures() {
                 refused += 1;
                 if refused > 256 {
                     break;

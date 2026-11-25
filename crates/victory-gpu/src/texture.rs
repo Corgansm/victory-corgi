@@ -66,6 +66,12 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Other addresses its pages show at ([`crate::inplace::aliases`]), as
+    /// of the views' generation `aliases_at` (0: not looked for yet).
+    aliases: Vec<(usize, usize)>,
+    aliases_at: u64,
+    /// More of them than are asked: the hash decides every time.
+    aliases_more: bool,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -279,6 +285,21 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     true
 }
 
+/// Whether a guarded texture whose pages show at another address too is
+/// hashed at every check (`VICTORY_TEXTURE_ALIASES=0`: no, the guard alone
+/// decides, as before).
+///
+/// Hashing guards nothing, and loads (run 20261124-161527: no missed
+/// change in 2,678 frames, about 1 ms a world frame of refreshes). Guarding
+/// the other addresses instead stopped loading at the same point every
+/// time (2.2 GB read, then no more reads: runs -155007 and -160049), and so
+/// did holding the kernel's writes open (-160539); what writes there
+/// without faulting is not yet known.
+fn aliases_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ALIASES").is_none_or(|v| v != "0"))
+}
+
 /// Whether a texture refresh that finds the runtime remapping title memory
 /// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
 /// default).
@@ -387,12 +408,23 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        crate::texdebug::forgotten(self.memory as usize);
     }
 }
 
-/// For the memory line: staging buffers alive, their bytes, and how many
-/// of them their texture still has (the others wait for a list's reset).
-#[cfg(feature = "diagnostics")]
+/// The bytes of title memory the staged texture at `memory` is read from
+/// (for the texture debugger's verifier).
+pub(crate) fn memory_size(memory: usize) -> Option<usize> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()?
+        .values()
+        .find(|s| s.memory as usize == memory)
+        .map(|s| s.layout.size as usize)
+}
+
+/// For the memory line and the texture debugger: staging buffers alive,
+/// their bytes, and how many of them their texture still has (the others
+/// wait for a list's reset).
 pub(crate) fn memory() -> [u64; 3] {
     use std::sync::atomic::Ordering::Relaxed;
     let kept = STAGING
@@ -577,6 +609,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
+    crate::texdebug::uploaded(staging.memory as usize);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -603,6 +636,7 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();
+        crate::texdebug::refreshed(started.elapsed().as_micros() as u64);
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
@@ -623,6 +657,7 @@ impl Staging {
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                crate::texdebug::skipped(start, crate::texdebug::SKIP_WATCH);
                 return 0;
             }
             last.asked = now;
@@ -630,7 +665,7 @@ impl Staging {
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
-                self.detile(read);
+                self.detile(read, crate::texdebug::WATCH);
             });
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
@@ -651,10 +686,35 @@ impl Staging {
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let before = last.asked;
+            let mut unwritten = before != 0 && written.iter().all(|&(_, w)| w <= before);
             last.asked = now;
+            // The pages may show at another address too, and a write there
+            // does not fault in this range's guards: the boot video's ring
+            // was written through the pool view it was filled in and read
+            // through the tiled heap the GPU mapped the same pages into,
+            // and showed a new frame only on every eighth (run 20261124-
+            // 154124, 1,176 changes the texture debugger saw missed). Such a
+            // texture is hashed at every check instead: the other addresses
+            // are not guarded (guarding them stopped loading, see
+            // `aliases_on`), so nothing else changes.
+            if unwritten && aliases_on() {
+                let generation = crate::inplace::generation();
+                if last.aliases_at != generation {
+                    let (found, more) = crate::inplace::aliases(start, size);
+                    crate::texdebug::aliased(start, found.len(), found.iter().map(|a| a.1).sum(), more);
+                    last.aliases = found;
+                    last.aliases_at = generation;
+                    last.aliases_more = more;
+                }
+                if last.aliases_more || !last.aliases.is_empty() {
+                    unwritten = false;
+                    crate::texdebug::alias_written(start);
+                }
+            }
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             if unwritten && !turn {
+                crate::texdebug::skipped(start, crate::texdebug::SKIP_GUARD);
                 return 0;
             }
         }
@@ -685,6 +745,7 @@ impl Staging {
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
             if last.partial.is_some_and(|at| frame < at + 30) {
+                crate::texdebug::skipped(start, crate::texdebug::SKIP_PARTIAL);
                 return 0;
             }
             last.partial = Some(frame);
@@ -700,7 +761,7 @@ impl Staging {
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
-                self.detile(read);
+                self.detile(read, crate::texdebug::PARTIAL);
                 true
             });
             #[cfg(feature = "diagnostics")]
@@ -716,10 +777,11 @@ impl Staging {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
+                    crate::texdebug::skipped(start, crate::texdebug::SKIP_SAME_HASH);
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(tiled);
+                self.detile(tiled, crate::texdebug::THROUGH);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -732,10 +794,11 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            crate::texdebug::skipped(start, crate::texdebug::SKIP_SAME_HASH);
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        self.detile(tiled, crate::texdebug::HASH);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -756,7 +819,7 @@ impl Staging {
             let hash = blake3::hash(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
-                self.detile(read);
+                self.detile(read, crate::texdebug::UNLOCKED);
             }
             true
         });
@@ -765,13 +828,16 @@ impl Staging {
             size
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
+            crate::texdebug::skipped(self.memory as usize, crate::texdebug::SKIP_UNREADABLE);
             last.asked = 0;
             0
         }
     }
 
-    /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Detiles `tiled` (the texture's memory) into the staging buffer;
+    /// `why`: how the refresh found it changed (`crate::texdebug`).
+    fn detile(&self, tiled: &[u8], why: u8) {
+        crate::texdebug::detiled(self.memory as usize, tiled, why);
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
@@ -1052,6 +1118,12 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
     });
     map.insert(resource as usize, s.clone());
+    crate::texdebug::created(memory as usize, total, || {
+        format!(
+            "{}x{}x{} f{} mips {} dim {}",
+            d.Width, d.Height, d.DepthOrArraySize, d.Format.0, d.MipLevels, d.Dimension.0
+        )
+    });
     Some(s)
 }
 

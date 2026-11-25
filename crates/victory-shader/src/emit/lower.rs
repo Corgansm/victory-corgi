@@ -7045,6 +7045,119 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // A double to a float in 32-bit integer steps on the
+                // register pair (the host path has no doubles): the sign,
+                // the exponent rebased from 1023 to 127, the mantissa's top
+                // 23 of 52 bits rounded to nearest even on the other 29.
+                // Too small for a normal float gives zero (denormals
+                // flushed, the console's default float mode); too large,
+                // infinity; NaN stays a quiet NaN. Three compute shaders of
+                // Grand Theft Auto VI's world dropped on it (run 20261124-
+                // 162447: 5dc3b25986622949, 6f225b641c5b0708,
+                // 926c46bab3b86bd6).
+                let Fields::Valu(v) = &inst.fields else {
+                    unreachable!()
+                };
+                if v.sdwa.is_some() || v.dpp.is_some() {
+                    return Err("64-bit operand modifiers");
+                }
+                let (abs, neg) = (v.abs & 1 != 0, v.neg & 1 != 0);
+                let op = *v.src.first().ok_or("a missing operand")?;
+                let regs = match op {
+                    Operand::Vector { reg, .. } => Some((Reg::V(reg), Reg::V(reg + 1))),
+                    Operand::Scalar { code, .. } if code != NULL => Some((Reg::S(code), Reg::S(code + 1))),
+                    _ => None,
+                };
+                let Some((r0, r1)) = regs else {
+                    // A constant: converted here. Integer inline constants
+                    // are that integer as a double, a literal the high half.
+                    let mut d = match op {
+                        Operand::Const(k @ 128..=192) => f64::from(k - 128),
+                        Operand::Const(k @ 193..=208) => -f64::from(k - 192),
+                        Operand::Const(240) => 0.5,
+                        Operand::Const(241) => -0.5,
+                        Operand::Const(242) => 1.0,
+                        Operand::Const(243) => -1.0,
+                        Operand::Const(244) => 2.0,
+                        Operand::Const(245) => -2.0,
+                        Operand::Const(246) => 4.0,
+                        Operand::Const(247) => -4.0,
+                        Operand::Const(248) => 1.0 / (2.0 * std::f64::consts::PI),
+                        Operand::Literal(x) => f64::from_bits(u64::from(x) << 32),
+                        Operand::Scalar { .. } => 0.0,
+                        _ => return Err("a special operand"),
+                    };
+                    if abs {
+                        d = d.abs();
+                    }
+                    if neg {
+                        d = -d;
+                    }
+                    let r = self.s.m.f32((d as f32).to_bits());
+                    return float(self, r);
+                };
+                let lo = self.i32_of(inst.read(r0).ok_or("an unread operand")?)?;
+                let mut hi = self.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+                let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+                if abs {
+                    let m = k(self, 0x7fff_ffff);
+                    hi = self.s.m.bin(c, Bin::And, hi, m);
+                }
+                if neg {
+                    let m = k(self, 0x8000_0000);
+                    hi = self.s.m.bin(c, Bin::Xor, hi, m);
+                }
+                let (k20, k3, k29, k23) = (k(self, 20), k(self, 3), k(self, 29), k(self, 23));
+                let sign_mask = k(self, 0x8000_0000);
+                let sign = self.s.m.bin(c, Bin::And, hi, sign_mask);
+                let e = self.s.m.bin(c, Bin::LShr, hi, k20);
+                let k7ff = k(self, 0x7ff);
+                let e = self.s.m.bin(c, Bin::And, e, k7ff);
+                let kfffff = k(self, 0xf_ffff);
+                let m_hi = self.s.m.bin(c, Bin::And, hi, kfffff);
+                // The float's 23 mantissa bits, and the 29 rounded away.
+                let top = self.s.m.bin(c, Bin::Shl, m_hi, k3);
+                let lo_top = self.s.m.bin(c, Bin::LShr, lo, k29);
+                let top = self.s.m.bin(c, Bin::Or, top, lo_top);
+                let k1fffffff = k(self, 0x1fff_ffff);
+                let rest = self.s.m.bin(c, Bin::And, lo, k1fffffff);
+                let k896 = k(self, 896);
+                let e32 = self.s.m.bin(c, Bin::Sub, e, k896);
+                let exp = self.s.m.bin(c, Bin::Shl, e32, k23);
+                let normal = self.s.m.bin(c, Bin::Or, sign, exp);
+                let normal = self.s.m.bin(c, Bin::Or, normal, top);
+                // Round to nearest, ties to even (a carry into the exponent
+                // is right, and gives infinity past the largest float).
+                let half = k(self, 0x1000_0000);
+                let above = self.s.m.cmp(c, pred::IUGT, rest, half);
+                let tie = self.s.m.cmp(c, pred::EQ, rest, half);
+                let one = k(self, 1);
+                let zero = k(self, 0);
+                let odd = self.s.m.bin(c, Bin::And, top, one);
+                let odd = self.s.m.cmp(c, pred::NE, odd, zero);
+                let tie_odd = self.s.m.bin(c, Bin::And, tie, odd);
+                let up = self.s.m.bin(c, Bin::Or, above, tie_odd);
+                let add = self.s.m.select(c, up, one, zero);
+                let rounded = self.s.m.bin(c, Bin::Add, normal, add);
+                // Out of a normal float's range, and infinity or NaN.
+                let inf = k(self, 0x7f80_0000);
+                let sign_inf = self.s.m.bin(c, Bin::Or, sign, inf);
+                let k255 = k(self, 255);
+                let over = self.s.m.cmp(c, pred::SGE, e32, k255);
+                let under = self.s.m.cmp(c, pred::SLE, e32, zero);
+                let r = self.s.m.select(c, over, sign_inf, rounded);
+                let r = self.s.m.select(c, under, sign, r);
+                let mant = self.s.m.bin(c, Bin::Or, m_hi, lo);
+                let has_mant = self.s.m.cmp(c, pred::NE, mant, zero);
+                let quiet = k(self, 0x40_0000);
+                let nan_bit = self.s.m.select(c, has_mant, quiet, zero);
+                let special = self.s.m.bin(c, Bin::Or, sign_inf, nan_bit);
+                let is_special = self.s.m.cmp(c, pred::EQ, e, k7ff);
+                let r = self.s.m.select(c, is_special, special, r);
+                let r = self.as_float(r);
+                float(self, r)
+            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;

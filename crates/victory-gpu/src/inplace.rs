@@ -269,9 +269,86 @@ struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// The same views by what they show: (section, offset, address) to
+    /// bytes. Pages can show at two addresses at once (Grand Theft Auto VI
+    /// fills pages through a pool view, then has the GPU map them into its
+    /// tiled heap, `map_alias`), and a write through one address does not
+    /// fault in a guard on the other ([`aliases`]).
+    by_section: BTreeMap<(usize, u64, usize), usize>,
+    /// Views longer than [`SHORT`], kept out of `by_section`: a pool view
+    /// can be gigabytes, and a search back that far would walk every page
+    /// view of the section. There are few: they are looked at one by one.
+    long: Vec<(usize, u64, usize, usize)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+/// How long a view in `Views::by_section` can be (see `Views::long`).
+const SHORT: usize = 2 << 20;
+
+static VIEWS: Mutex<Views> = Mutex::new(Views {
+    views: BTreeMap::new(),
+    sections: Vec::new(),
+    by_section: BTreeMap::new(),
+    long: Vec::new(),
+});
+
+/// Changes whenever a view is told of or forgotten: what [`aliases`] found
+/// for a range stands while it does not.
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// The views' generation ([`GENERATION`]).
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+/// The other places the pages of `[at, at + len)` show at: address ranges
+/// of other views of the same section offsets, outside the range itself.
+/// Empty for memory no view of ours holds (private memory, or not mapped).
+/// At most `MAX` pieces; more are left out (and `true` says so).
+pub(crate) fn aliases(at: usize, len: usize) -> (Vec<(usize, usize)>, bool) {
+    const MAX: usize = 4096;
+    let v = views();
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    if (v.by_section.is_empty() && v.long.is_empty()) || len == 0 {
+        return (found, false);
+    }
+    let end = at.saturating_add(len);
+    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(&b, &view)| (b, view));
+    let pieces = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(&b, &view)| (b, view)));
+    let mut more = false;
+    for (base, (bytes, section, offset)) in pieces {
+        let (from, to) = (base.max(at), (base + bytes).min(end));
+        if from >= to {
+            continue;
+        }
+        let (o0, o1) = (offset + (from - base) as u64, offset + (to - base) as u64);
+        let low = (section, o0.saturating_sub(SHORT as u64), 0);
+        let short = v.by_section.range(low..(section, o1, 0)).map(|(&(s, o, a), &n)| (s, o, a, n));
+        let long = v.long.iter().copied();
+        for (s, o, a, n) in short.chain(long) {
+            if s != section || o + n as u64 <= o0 {
+                continue;
+            }
+            // The range's own view.
+            if a < end && a + n > at {
+                continue;
+            }
+            let (lo, hi) = (o.max(o0), (o + n as u64).min(o1));
+            let start = a + (lo - o) as usize;
+            let piece = (start, (hi - lo) as usize);
+            match found.last_mut() {
+                Some(last) if last.0 + last.1 == piece.0 => last.1 += piece.1,
+                _ => {
+                    if found.len() == MAX {
+                        more = true;
+                        break;
+                    }
+                    found.push(piece);
+                }
+            }
+        }
+    }
+    (found, more)
+}
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -288,7 +365,17 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    let mut v = views();
+    if let Some((_, s, o)) = v.views.insert(at, (len, section, offset)) {
+        v.by_section.remove(&(s, o, at));
+        v.long.retain(|&(_, _, a, _)| a != at);
+    }
+    if len > SHORT {
+        v.long.push((section, offset, at, len));
+    } else {
+        v.by_section.insert((section, offset, at), len);
+    }
+    GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -303,8 +390,15 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        if let Some((n, s, o)) = v.views.remove(&base) {
+            if n > SHORT {
+                v.long.retain(|&(_, _, a, _)| a != base);
+            } else {
+                v.by_section.remove(&(s, o, base));
+            }
+        }
     }
+    GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// How the views cover `[at, at + len)`.
