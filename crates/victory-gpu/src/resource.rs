@@ -497,6 +497,7 @@ fn twin_texture(
             &mut texture,
         )
     };
+    crate::census::made(6, 0);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
     }
@@ -1191,6 +1192,26 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`hold`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of. `None` if it is no texture, or is being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    // A texture leaves the table before it is freed, under this lock.
+    let all = textures();
+    (all.contains(&(this as usize)) && crate::object::add_ref_alive(this)).then(|| Held(this))
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1445,8 +1466,11 @@ pub(crate) fn room() -> bool {
         // (`crate::shadow::card_room_kept`) and for the render targets a
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
+        // So does what is kept for windows in GPU upload heaps not made yet
+        // (`crate::shadow::window_upload_room_kept`; 0 unless asked for).
         Some([budget, used, ..]) => {
-            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+            used + crate::shadow::card_room_kept() + crate::shadow::window_upload_room_kept() + targets_room_kept()
+                < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -2176,7 +2200,8 @@ fn host_texture_as(
     // memory when the card has no room ([`system_textures`]): read over
     // the bus, but there, where it was not made at all and its materials
     // drew black.
-    let system = !reserved && fills(desc) && system_textures() && !room();
+    // Only while the PC has memory to spare ([`system_room`]).
+    let system = !reserved && fills(desc) && !room() && system_room();
     let card = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -2249,6 +2274,7 @@ fn host_texture_as(
     if made.is_err() && !reserved {
         made = create(&card, &mut texture);
     }
+    crate::census::made(if reserved { 5 } else { 4 }, 0);
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
@@ -2273,6 +2299,71 @@ pub(crate) static SYSTEM_TEXTURES: std::sync::atomic::AtomicU64 = std::sync::ato
 pub(crate) fn system_textures() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SYSTEM_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Times [`system_room`] found the PC short of memory.
+pub(crate) static SYSTEM_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a texture the title fills may be made in the PC's memory now that
+/// the card has no room ([`system_textures`]): only while the PC keeps
+/// memory to spare. Nothing bounded these textures. In run 20261125-161523
+/// the process stood at 30 to 32 GB private on a PC of 32 GB for ten
+/// minutes, 20 GB of it paged out, with 0.5 to 2 GB of the PC free and 1 to
+/// 3.5 GB left to commit, and in the 40 seconds before the device was lost
+/// they took 3 GB more of the PC's memory.
+///
+/// Below either line a texture picked by index waits, as it does with
+/// `VICTORY_SYSTEM_TEXTURES=0` (`draw.rs` `heap_textures`), until the sweep
+/// has let idle copies go ([`let_go_idle`]). `VICTORY_SYSTEM_TEXTURES_FREE_MB`
+/// (1,024) is the physical memory kept free, `VICTORY_SYSTEM_TEXTURES_COMMIT_MB`
+/// (4,096) what is kept of the commit limit; 0 for both is as before. The
+/// system is asked at most every tenth of a second.
+#[cfg(windows)]
+pub(crate) fn system_room() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    if !system_textures() {
+        return false;
+    }
+    static FLOORS: std::sync::OnceLock<[u64; 2]> = std::sync::OnceLock::new();
+    let [free_floor, commit_floor] = *FLOORS.get_or_init(|| {
+        let mb = |name: &str, default: u64| {
+            let asked = std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            asked.unwrap_or(default).min(1 << 20) << 20
+        };
+        [
+            mb("VICTORY_SYSTEM_TEXTURES_FREE_MB", 1024),
+            mb("VICTORY_SYSTEM_TEXTURES_COMMIT_MB", 4096),
+        ]
+    });
+    // The tenth of a second of the last asking, counted from 1, and its
+    // answer in the lowest bit (as in `room_lately`).
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let last = LAST.load(Relaxed);
+    if last >> 1 == tenth {
+        return last & 1 != 0;
+    }
+    let memory = crate::host::available_memory();
+    let room = crate::host::pc_room(memory, free_floor, commit_floor);
+    LAST.store((tenth << 1) | u64::from(room), Relaxed);
+    if !room {
+        // Said the first time, then about once a minute while it lasts.
+        let n = SYSTEM_REFUSED.fetch_add(1, Relaxed);
+        if n.is_multiple_of(600) {
+            let [free, commit] = memory.unwrap_or_default();
+            tracing::info!(
+                "textures the title fills: the card has no room and the PC is short of memory ({} MB free, {} MB left \
+                 to commit; kept free: {} MB and {} MB), so new ones wait instead of being made in the PC's memory \
+                 (asked {} times so far; VICTORY_SYSTEM_TEXTURES_FREE_MB, VICTORY_SYSTEM_TEXTURES_COMMIT_MB)",
+                free >> 20,
+                commit >> 20,
+                free_floor >> 20,
+                commit_floor >> 20,
+                n + 1
+            );
+        }
+    }
+    room
 }
 
 /// The host copy of title texture `this` if it is made and was made
@@ -2672,6 +2763,7 @@ static PLACED_TWINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 /// See [`PLACED_TWINS`].
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }

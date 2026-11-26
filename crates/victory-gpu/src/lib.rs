@@ -18,6 +18,8 @@
 pub mod apis;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -26,10 +28,18 @@ mod debugger;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod drvwatch;
+#[cfg(windows)]
+mod spread;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod framelog;
+#[cfg(windows)]
+mod heap_worker;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -40,15 +50,23 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod plaincopy;
+#[cfg(windows)]
 mod primitive;
 #[cfg(windows)]
 mod pix;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod frameprof;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
+#[cfg(windows)]
+mod census;
 #[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
@@ -70,9 +88,11 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use census::title_memory_reserved;
+#[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
     writing as kernel_will_write,
 };

@@ -72,12 +72,11 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last), and those of one
-    // register by their name's offset: the order of the elements, not of
-    // their columns. (Sorted by column, the 16 programs of Grand Theft
-    // Auto VI's whose second element of a row sits in the lower columns
-    // had a part the validator's own did not match: "Container part
-    // 'Program Input Signature' does not match expected for module".)
+    // the rows sorted by register (unallocated last), then by name offset:
+    // of two elements packed into one register, the one first in element
+    // order comes first whatever its columns (a sort by column made the
+    // validator refuse 72 of the title's vertex, mesh and pixel programs:
+    // "does not match expected for module").
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -120,34 +119,48 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     out
 }
 
-/// Elements packed into one row are interpolated one way (the validator:
-/// "has interpolation mode that differs from another element packed into
-/// the same row"). An integer element is constant, so a float element the
-/// title packed beside one was declared `nointerpolation`; the signature
-/// part does not say so, and by default a float is linear. The row takes
-/// the mode of its integer elements, else, with `read_decides` (pixel
-/// inputs, whose reads say how they are interpolated), of the elements the
-/// program reads; the arbitrary elements that differ follow, those read
-/// another way excepted (that is the program's own doing, and stays told).
-pub(crate) fn settle_row_modes(elements: &mut [SigElement], read_decides: bool) {
-    for i in 0..elements.len() {
-        let Some(row) = elements[i].row else { continue };
-        if elements[..i].iter().any(|e| e.row == Some(row)) {
+/// One interpolation mode per register. The console's compiler packs only elements of one
+/// mode into a register, and the validator refuses two ("has interpolation mode that differs
+/// from another element packed into the same row"), but the modes here are partly defaults: a
+/// float is linear unless a pixel program's reads say otherwise, so a float the console
+/// declared `nointerpolation` beside an integer came out linear. Where a register's modes
+/// differ, the elements whose mode is fixed give it to the others if they agree on one: an
+/// integer or the front face (constant only) and, with `read` (pixel inputs), an element the
+/// program reads (the mode its reads asked for). The others' mode decides nothing: an
+/// output's interpolation is the pixel input's, and an input no read asks for is never
+/// interpolated. A register whose modes agree stays as it was.
+/// The title's 70 programs that packed two modes into a register (23 vertex and mesh, 47
+/// pixel) each had a float of the console's constant mode (its `PSV0`) beside an integer, the
+/// front face, or an input read at its vertices, that float written (outputs) or not read
+/// (inputs).
+pub(crate) fn one_mode_per_register(elements: &mut [SigElement], read: bool) {
+    let fixed = |e: &SigElement| e.comp != 9 || e.kind == 13 || (read && e.usage != 0);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        // (an undefined mode, 0, takes the others' in the validator)
+        let of = |e: &SigElement| e.row == Some(row) && e.interp != 0;
+        let mut modes: Vec<u8> = elements
+            .iter()
+            .filter(|e| of(e))
+            .map(|e| e.interp)
+            .collect();
+        modes.sort_unstable();
+        modes.dedup();
+        if modes.len() < 2 {
             continue;
         }
-        let of_row = |e: &&SigElement| e.row == Some(row) && e.interp != 0;
-        let mode = elements
+        let mut given: Vec<u8> = elements
             .iter()
-            .filter(of_row)
-            .find(|e| e.comp != 9)
-            .or_else(|| elements.iter().filter(of_row).find(|e| read_decides && e.usage != 0))
-            .map(|e| e.interp);
-        let Some(mode) = mode else { continue };
-        for e in elements.iter_mut() {
-            let follows = e.row == Some(row) && e.kind == 0 && e.interp != 0 && e.interp != mode;
-            if follows && !(read_decides && e.usage != 0) {
-                e.interp = mode;
-            }
+            .filter(|e| of(e) && fixed(e))
+            .map(|e| e.interp)
+            .collect();
+        given.sort_unstable();
+        given.dedup();
+        let [mode] = given[..] else { continue };
+        for e in elements.iter_mut().filter(|e| of(e) && !fixed(e)) {
+            e.interp = mode;
         }
     }
 }
@@ -438,6 +451,91 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 mod tests {
     use super::*;
 
+    /// Two elements packed into one register are written in element order, not by column
+    /// (the title's packed pedestrian outputs: TEXCOORD22 in columns 1-2 of the register
+    /// whose column 0 is COLOR0, listed after it).
+    #[test]
+    fn rows_of_one_register_keep_the_element_order() {
+        let element = |name: &str, index, row, col, cols| SigElement {
+            name: name.into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let part = signature(
+            &[
+                element("TEXCOORD", 19, 13, 0, 3),
+                element("TEXCOORD", 22, 14, 1, 2),
+                element("COLOR", 0, 14, 0, 1),
+                element("TEXCOORD", 21, 15, 0, 3),
+            ],
+            false,
+        );
+        let u32_at = |at: usize| u32::from_le_bytes(part[at..at + 4].try_into().unwrap());
+        // (register, semantic index, mask) of each 32-byte row after the 8-byte header
+        let rows: Vec<(u32, u32, u8)> = (0..4)
+            .map(|k| 8 + 32 * k)
+            .map(|at| (u32_at(at + 20), u32_at(at + 8), part[at + 24]))
+            .collect();
+        assert_eq!(rows, [(13, 19, 0b111), (14, 22, 0b110), (14, 0, 0b1), (15, 21, 0b111)]);
+    }
+
+    /// The registers of the title's programs that packed two modes: a float beside an integer
+    /// or the front face, an unread input beside one read at its vertices. Registers whose modes
+    /// agree, and those whose fixed elements disagree, keep their modes.
+    #[test]
+    fn one_register_takes_the_mode_of_its_fixed_elements() {
+        let element = |name: &str, row, col, cols, comp, interp, usage| SigElement {
+            name: name.into(),
+            index: 0,
+            kind: if name == "SV_IsFrontFace" { 13 } else { 0 },
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols,
+            usage,
+            half: false,
+        };
+        let modes = |els: &[SigElement]| els.iter().map(|e| e.interp).collect::<Vec<_>>();
+        // VS_Transform_VfxVBuffer_AlphaClip's outputs: TEXCOORD2 (float2) beside TEXCOORD14
+        // (uint2) in register 7; register 6 holds two linear floats.
+        let mut outputs = vec![
+            element("TEXCOORD", 6, 0, 3, 9, 2, 0b111),
+            element("TEXCOORD", 6, 3, 1, 9, 2, 0b1),
+            element("TEXCOORD", 7, 0, 2, 9, 2, 0b11),
+            element("TEXCOORD", 7, 2, 2, 5, 1, 0b11),
+        ];
+        one_mode_per_register(&mut outputs, false);
+        assert_eq!(modes(&outputs), [2, 2, 1, 1]);
+        // A pixel program's inputs: an unread float beside the front face; another beside an
+        // input read at its vertices (constant), where the float would be linear.
+        let mut inputs = vec![
+            element("TEXCOORD", 9, 0, 1, 9, 2, 0),
+            element("SV_IsFrontFace", 9, 1, 1, 5, 1, 0b1),
+            element("NORMAL", 5, 0, 3, 9, 2, 0),
+            element("TEXCOORD", 5, 3, 1, 9, 1, 0b1),
+        ];
+        one_mode_per_register(&mut inputs, true);
+        assert_eq!(modes(&inputs), [1, 1, 1, 1]);
+        // Two floats a pixel program reads in two modes: no element gives the register one.
+        let mut both = vec![
+            element("TEXCOORD", 3, 0, 2, 9, 2, 0b11),
+            element("TEXCOORD", 3, 2, 2, 9, 3, 0b11),
+        ];
+        one_mode_per_register(&mut both, true);
+        assert_eq!(modes(&both), [2, 3]);
+        // As outputs nothing is read: the floats keep their defaults too.
+        one_mode_per_register(&mut both, false);
+        assert_eq!(modes(&both), [2, 3]);
+    }
+
     #[test]
     fn md5_core_matches_the_standard() {
         // Standard MD5 of "abc" with standard padding, through md5_block.
@@ -482,22 +580,5 @@ mod tests {
         assert_eq!(row(1), ("TEXCOORD".to_owned(), 5, 4, 0b1111));
         assert_eq!(row(2), ("TEXCOORD".to_owned(), 3, 5, 0b1000));
         assert_eq!(row(3), ("NORMAL".to_owned(), 0, 5, 0b0111));
-    }
-
-    /// A float packed beside an integer is constant like it (mesh program
-    /// 0bd4d80ad23b106b: TEXCOORD8, a uint, and TEXCOORD11 in row 9); a
-    /// pixel input that is not read follows the one that is, and one read
-    /// another way is left as the program reads it.
-    #[test]
-    fn a_row_has_one_interpolation_mode() {
-        let mut outputs = [element("TEXCOORD", 8, 5, 9, 0, 3), element("TEXCOORD", 11, 9, 9, 3, 1), element("TEXCOORD", 9, 9, 10, 0, 4)];
-        settle_row_modes(&mut outputs, false);
-        assert_eq!(outputs.each_ref().map(|e| e.interp), [1, 1, 2]);
-        let mut inputs = [element("TEXCOORD", 0, 9, 1, 0, 2), element("TEXCOORD", 1, 9, 1, 2, 2), element("TEXCOORD", 2, 9, 2, 0, 2), element("TEXCOORD", 3, 9, 2, 2, 2)];
-        (inputs[1].interp, inputs[1].usage) = (5, 0b11);
-        (inputs[2].interp, inputs[2].usage) = (2, 0b01);
-        (inputs[3].interp, inputs[3].usage) = (5, 0b11);
-        settle_row_modes(&mut inputs, true);
-        assert_eq!(inputs.each_ref().map(|e| e.interp), [5, 5, 2, 5]);
     }
 }

@@ -259,13 +259,19 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// bits for `both`. For timing only: without the waits a shader may read
 /// what another has not finished writing.
 pub(crate) fn barrier_test() -> u8 {
+    fn bits(v: Option<&str>) -> u8 {
+        match v {
+            Some("groups") => 1,
+            Some("indirect") => 2,
+            Some("both") => 3,
+            _ => 0,
+        }
+    }
+    if let Some(v) = crate::host::live::value("barrier_test") {
+        return bits(Some(&v));
+    }
     static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
-        Ok("groups") => 1,
-        Ok("indirect") => 2,
-        Ok("both") => 3,
-        _ => 0,
-    })
+    *TEST.get_or_init(|| bits(std::env::var("VICTORY_BARRIER_TEST").ok().as_deref()))
 }
 
 /// Per range compared after a submission (start, length): times, and the
@@ -1081,6 +1087,7 @@ pub(crate) fn by_line_say(frames: f64) {
         .map(|&(line, ns, n)| format!("{}{} {:.1} ms in {:.0} ({:.1} us each)", if line >= 1_000_000 { "part " } else { "list.rs:" }, line % 1_000_000, ns as f64 / 1e6 / frames, n as f64 / frames, ns as f64 / 1e3 / n.max(1) as f64))
         .collect();
     tracing::info!("  list calls by calling line, per frame, all threads: {}", text.join("; "));
+    crate::draw::memo_say(frames);
 }
 
 /// A list call on this thread that began at `started` has returned.
@@ -1088,6 +1095,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1101,6 +1111,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1251,7 +1267,7 @@ pub(crate) fn log(frames: f64) {
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
-         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+         {written} views noted written by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
@@ -1376,10 +1392,13 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
     );
+    crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours each), {:.0} \

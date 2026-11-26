@@ -101,6 +101,35 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
 }
 
 impl GraphicsState {
+    /// The blend state as the host takes it: no blending and no logic
+    /// operation on a render target of an integer format. The console lets a
+    /// pipeline ask for blending there (it does nothing: integer targets do
+    /// not blend); D3D12 refuses the whole pipeline ("this format does not
+    /// support blending", E_INVALIDARG), and its draws were dropped every
+    /// frame. Shared blending (one state for every target) becomes per
+    /// target when it has to be cleared for some.
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut b = self.blend;
+        let n = (self.targets.NumRenderTargets as usize).min(8);
+        let integer = |f: DXGI_FORMAT| is_integer_format(f);
+        let any = (0..n).any(|i| integer(self.targets.RTFormats[i]));
+        if !any {
+            return b;
+        }
+        if !b.IndependentBlendEnable.as_bool() {
+            let first = b.RenderTarget[0];
+            b.RenderTarget = [first; 8];
+            b.IndependentBlendEnable = true.into();
+        }
+        for i in 0..n {
+            if integer(self.targets.RTFormats[i]) {
+                b.RenderTarget[i].BlendEnable = false.into();
+                b.RenderTarget[i].LogicOpEnable = false.into();
+            }
+        }
+        b
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -214,36 +243,6 @@ impl GraphicsState {
             self.depth_format.0,
             self.samples,
         )
-    }
-
-    /// The blend state as the host takes it: no blending on a target of an integer
-    /// format, which D3D12 refuses ("The render target format at slot 2 is format
-    /// (R8_UINT). This format does not support blending"; run 20261124-173313: the mesh
-    /// pipeline f5e50eb2108c425b + ce3f0432a08f1d35). The console writes such a
-    /// target's bits unblended, which is what the host does then too.
-    fn host_blend(&self) -> D3D12_BLEND_DESC {
-        let mut b = self.blend;
-        let n = (self.targets.NumRenderTargets as usize).min(8);
-        let target = |b: &D3D12_BLEND_DESC, i: usize| {
-            if b.IndependentBlendEnable.as_bool() { b.RenderTarget[i] } else { b.RenderTarget[0] }
-        };
-        let clash = |b: &D3D12_BLEND_DESC| {
-            (0..n).any(|i| integer_format(self.targets.RTFormats[i]) && target(b, i).BlendEnable.as_bool())
-        };
-        if !clash(&b) {
-            return b;
-        }
-        if !b.IndependentBlendEnable.as_bool() {
-            let first = b.RenderTarget[0];
-            b.RenderTarget = [first; 8];
-            b.IndependentBlendEnable = true.into();
-        }
-        for i in 0..n {
-            if integer_format(self.targets.RTFormats[i]) {
-                b.RenderTarget[i].BlendEnable = false.into();
-            }
-        }
-        b
     }
 
     /// The depth and stencil state with the depth bounds test, for a stream.
@@ -452,6 +451,9 @@ impl HostPipeline {
             s.translated()?;
         }
         let host = host()?;
+        // `VICTORY_SHADER_HOT_DIR`: a stage's code from a file in place of its
+        // translation (`super::hot`; only while making a pipeline with one).
+        let hot: Vec<Option<Arc<Vec<u8>>>> = stages.iter().map(|(s, _)| super::hot::override_for(&s.hash)).collect();
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -610,6 +612,12 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
+            if let Some(Some(dxil)) = hot.get(i) {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: dxil.as_ptr().cast(),
+                    BytecodeLength: dxil.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -677,7 +685,24 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
+            // A mesh program whose outputs pass D3D12's 32 KiB is linked with this pixel
+            // program ([`linked`]): the pipeline gets the two made for each other, which bind
+            // as the shared translations do.
+            // (not with a hot stage: the file's code is taken as it is)
+            let pair = if hot.iter().any(Option::is_some) {
+                None
+            } else {
+                stages.get(1).and_then(|(ps, _)| linked(ms, ps))
+            };
+            let bytecode = |dxil: &[u8]| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: dxil.as_ptr().cast(),
+                BytecodeLength: dxil.len(),
+            };
+            let (ms_code, ps_code) = match &pair {
+                Some(pair) => (bytecode(&pair.0.dxil), bytecode(&pair.1.dxil)),
+                None => (code(0), code(1)),
+            };
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -685,20 +710,20 @@ impl HostPipeline {
             let name = super::library::name(
                 "mesh triangles depth1",
                 &root_blob,
-                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &[&code_bytes(&ms_code), &code_bytes(&ps_code)],
                 &state,
             );
-            let made = mesh_pipeline(&host.device, &root, None, code(0), code(1), g, depth_bounds, &name);
+            let made = mesh_pipeline(&host.device, &root, None, ms_code, ps_code, g, depth_bounds, &name);
             let amplify = match (amplify, amplifier()) {
                 (Some((buffer_at, offset_at)), Some(stage)) if made.is_ok() => {
                     let with = super::library::name(
                         "mesh triangles amplified",
                         &root_blob,
-                        &[stage, &code_bytes(&code(0)), &code_bytes(&code(1))],
+                        &[stage, &code_bytes(&ms_code), &code_bytes(&ps_code)],
                         &state,
                     );
                     let stage = D3D12_SHADER_BYTECODE { pShaderBytecode: stage.as_ptr().cast(), BytecodeLength: stage.len() };
-                    match mesh_pipeline(&host.device, &root, Some(stage), code(0), code(1), g, depth_bounds, &with) {
+                    match mesh_pipeline(&host.device, &root, Some(stage), ms_code, ps_code, g, depth_bounds, &with) {
                         Ok(pso) => Some((pso, buffer_at, offset_at)),
                         Err(e) => {
                             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -743,9 +768,15 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
-            match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
+            let ps = match hot.get(1) {
+                Some(Some(dxil)) => Some(&dxil[..]),
+                _ => stages.get(1).and_then(|(s, _)| s.translated()).map(|t| &t.host.dxil[..]),
+            };
+            let vs = match hot.first() {
+                Some(Some(dxil)) => &dxil[..],
+                _ => &stages[0].0.translated()?.host.dxil[..],
+            };
+            match victory_shader::emit::rect_list_gs(vs, ps) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
             }
@@ -1028,6 +1059,59 @@ fn graphics_depth_bounds_pipeline(
         };
         stream_pipeline(device, &mut stream, name)
     }
+}
+
+/// The mesh program `ms` and the pixel program `ps` translated for one pipeline
+/// ([`victory_shader::emit::link_mesh`]), when `ms`'s outputs pass D3D12's 32 KiB as it is
+/// translated alone: 71 of the title's mesh programs (pedestrian, vehicle and prop transforms
+/// with fire, spatter, decal and transmission variants) declare 65 to 71 output components
+/// for 128 vertices, which the validator refuses; NVIDIA's driver built them anyway. Linked,
+/// the mesh program writes only the outputs `ps` reads and `ps` declares only the inputs it
+/// reads. Made once per pair (both programs translated again, not kept on disk: the pipeline
+/// library keeps the pipeline); `None` when `ms` fits, or the pair does not link (then the
+/// pipeline is made of the shared translations, as before). `VICTORY_MESH_LINK=0` turns it
+/// off.
+fn linked(
+    ms: &Arc<Shader>,
+    ps: &Arc<Shader>,
+) -> Option<Arc<(victory_shader::emit::HostShader, victory_shader::emit::HostShader)>> {
+    type Pair = Option<Arc<(victory_shader::emit::HostShader, victory_shader::emit::HostShader)>>;
+    static PAIRS: std::sync::Mutex<Option<std::collections::HashMap<(String, String), Pair>>> =
+        std::sync::Mutex::new(None);
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MESH_LINK").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    let (tm, tp) = (ms.translated()?, ps.translated()?);
+    // (most mesh programs fit: nothing more to do for them)
+    if victory_shader::emit::mesh_fits(&tm.host.dxil).unwrap_or(true) {
+        return None;
+    }
+    let key = (ms.hash.clone(), ps.hash.clone());
+    if let Some(pair) = PAIRS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).get(&key) {
+        return pair.clone();
+    }
+    // (translated outside the lock: two workers on one pair translate it twice at worst)
+    let pair = match victory_shader::emit::link_mesh(&ms.container, &tm.host, &ps.container, &tp.host) {
+        Ok(Some(pair)) => {
+            tracing::info!(shaders = ?[ms, ps], "mesh outputs over 32 KiB: the pair is linked for its pipeline");
+            Some(Arc::new(pair))
+        }
+        Ok(None) => {
+            tracing::warn!(shaders = ?[ms, ps], "mesh outputs over 32 KiB, and the pair does not link");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(shaders = ?[ms, ps], error = %e, "mesh outputs over 32 KiB, and the pair does not translate linked");
+            None
+        }
+    };
+    PAIRS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(key, pair.clone());
+    pair
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state
@@ -1569,5 +1653,62 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+}
+
+/// Whether render targets of format `f` hold integers (`_UINT`, `_SINT`):
+/// they cannot blend.
+fn is_integer_format(f: DXGI_FORMAT) -> bool {
+    matches!(
+        f,
+        DXGI_FORMAT_R32G32B32A32_UINT
+            | DXGI_FORMAT_R32G32B32A32_SINT
+            | DXGI_FORMAT_R32G32B32_UINT
+            | DXGI_FORMAT_R32G32B32_SINT
+            | DXGI_FORMAT_R16G16B16A16_UINT
+            | DXGI_FORMAT_R16G16B16A16_SINT
+            | DXGI_FORMAT_R32G32_UINT
+            | DXGI_FORMAT_R32G32_SINT
+            | DXGI_FORMAT_R10G10B10A2_UINT
+            | DXGI_FORMAT_R8G8B8A8_UINT
+            | DXGI_FORMAT_R8G8B8A8_SINT
+            | DXGI_FORMAT_R16G16_UINT
+            | DXGI_FORMAT_R16G16_SINT
+            | DXGI_FORMAT_R32_UINT
+            | DXGI_FORMAT_R32_SINT
+            | DXGI_FORMAT_R8G8_UINT
+            | DXGI_FORMAT_R8G8_SINT
+            | DXGI_FORMAT_R16_UINT
+            | DXGI_FORMAT_R16_SINT
+            | DXGI_FORMAT_R8_UINT
+            | DXGI_FORMAT_R8_SINT
+    )
+}
+
+#[cfg(test)]
+mod host_blend_tests {
+    use super::*;
+
+    /// Shared blending over an R8_UINT target in slot 2: the host state
+    /// keeps it on the float targets and turns it off on the integer one.
+    #[test]
+    fn integer_targets_do_not_blend() {
+        let mut g = GraphicsState::default();
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.blend.RenderTarget[0].RenderTargetWriteMask = 0xF;
+        g.targets.NumRenderTargets = 3;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
+        let b = g.host_blend();
+        assert!(b.IndependentBlendEnable.as_bool());
+        assert!(b.RenderTarget[0].BlendEnable.as_bool());
+        assert!(b.RenderTarget[1].BlendEnable.as_bool());
+        assert!(!b.RenderTarget[2].BlendEnable.as_bool());
+        assert_eq!(b.RenderTarget[2].RenderTargetWriteMask, 0xF);
+        // Float targets only: the state as given.
+        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UNORM;
+        let b = g.host_blend();
+        assert!(!b.IndependentBlendEnable.as_bool());
     }
 }

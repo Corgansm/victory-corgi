@@ -110,14 +110,43 @@ TITLE = re.compile(r"(?P<fps>[\d.]+)\s*fps.*?(?P<draws>\d+)\s*draws/frame", re.I
 KEY_NAME = re.compile(r"^[A-Za-z0-9]$|^(Enter|Esc|Tab|Back|Up|Down|Left|Right|Menu|Start|View)$")
 
 
+# Where the bulk of what runs write goes (run logs, captures, the debugger's frames, preset caches): the
+# internal drive. The system drive of this PC is a USB disk that also holds the page file, and run
+# 20261125-161523 kept it 91 to 100 % busy while the process paged (its pipeline library, 533 MB, was
+# rewritten 26 times there). VICTORY_MCP_DATA_ROOT names another folder; a folder that cannot be made
+# (no such drive) leaves everything where it was.
+DATA_ROOT = Path(os.environ.get("VICTORY_MCP_DATA_ROOT", r"D:\victory-data"))
+
+
+def data_root() -> Path | None:
+    """DATA_ROOT, made if need be; None where it cannot be."""
+    try:
+        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return DATA_ROOT
+
+
+def preset_cache(name: str) -> Path | None:
+    """The cache folder of a preset that has its own: under the data root, else under %LOCALAPPDATA%\\victory."""
+    cache = PRESET_CACHE.get(name)
+    if not cache:
+        return None
+    root = data_root()
+    if root is not None:
+        return root / cache
+    if "LOCALAPPDATA" in os.environ:
+        return Path(os.environ["LOCALAPPDATA"]) / "victory" / cache
+    return None
+
+
 def preset_env(name: str) -> dict[str, str]:
     """The environment of a preset, with its own cache folder where it has one."""
     if name not in PRESETS:
         raise ValueError(f"no preset {name!r}; presets: {', '.join(PRESETS)}")
     env = dict(PRESETS[name])
-    cache = PRESET_CACHE.get(name)
-    if cache and "LOCALAPPDATA" in os.environ:
-        folder = Path(os.environ["LOCALAPPDATA"]) / "victory" / cache
+    folder = preset_cache(name)
+    if folder is not None:
         (folder / "pipelines").mkdir(parents=True, exist_ok=True)
         env["VICTORY_CACHE_DIR"] = str(folder)
     return env

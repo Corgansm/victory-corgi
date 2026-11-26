@@ -637,7 +637,7 @@ fn relative(
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
     // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; Grand Theft Auto VI walks
+    // not every device's readings in time order; the title walks
     // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
@@ -712,7 +712,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -911,7 +911,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -1149,8 +1149,7 @@ mod host {
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
-            // to the pad (Grand Theft Auto VI's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
+            // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
@@ -1162,10 +1161,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1181,8 +1177,8 @@ mod host {
                     // SAFETY: plain query.
                     scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
                     virtual_key: vk,
-                    // shortcut: no characters (code point 0); Grand Theft
-                    // Auto VI reads scan codes and virtual keys only.
+                    // shortcut: no characters (code point 0);
+                    // the title reads scan codes and virtual keys only.
                     ..Default::default()
                 })
                 .collect()
@@ -1199,15 +1195,15 @@ mod host {
     }
 
     /// A key by name: a letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`,
-    /// `Up`, `Down`, `Left`, `Right` (the stand-in pad's table maps them to
-    /// buttons); also the pad's own names `A`..`Y` go through the letters.
-    #[cfg(feature = "diagnostics")]
+    /// `Up`, `Down`, `Left`, `Right`; and the pad's buttons by their own
+    /// names through the stand-in pad's table: `PadA` (Enter), `PadB`
+    /// (Backspace), `Start`/`Menu` (Esc), `View` (Tab).
     fn named(key: &str) -> Option<u8> {
         Some(match key.trim() {
-            "Enter" | "enter" => 0x0D,
+            "Enter" | "enter" | "PadA" => 0x0D,
             "Esc" | "esc" | "Menu" | "Start" => 0x1B,
             "Tab" | "tab" | "View" => 0x09,
-            "Back" | "back" => 0x08,
+            "Back" | "back" | "PadB" => 0x08,
             "Up" | "up" => 0x26,
             "Down" | "down" => 0x28,
             "Left" | "left" => 0x25,
@@ -1217,10 +1213,11 @@ mod host {
         })
     }
 
-    /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
-    /// 0.2 s that long after input starts, with or without focus (keys by
-    /// [`named`]). Also the keys of `VICTORY_INPUT_FILE` ([`live`]).
-    #[cfg(feature = "diagnostics")]
+    /// Scripted keys, for test runs without a hand on the pad:
+    /// `VICTORY_KEYS=<seconds>:<key>,...` holds each key for 0.2 s that long
+    /// after input starts, and the lines of `VICTORY_INPUT_FILE` ([`live`]),
+    /// with or without focus (keys by [`named`]; they also press the first
+    /// real pad's buttons). Nothing unless one of the two is set.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1245,13 +1242,12 @@ mod host {
         down
     }
 
-    /// Keys pressed from outside while the title runs (the harness's `press`):
-    /// `VICTORY_INPUT_FILE=<path>`, a file that lines are appended to, each
-    /// `<key>[+<key>...] [<hold ms>]` (keys by [`named`], hold 150 ms when left
-    /// out). Each new line is pressed when it is seen (the file is looked at
-    /// every 50 ms), with or without focus; a file made shorter is read again
-    /// from its start.
-    #[cfg(feature = "diagnostics")]
+    /// Keys pressed from outside while the title runs (after
+    /// Corgansm/victory-corgi's input file): `VICTORY_INPUT_FILE=<path>`, a
+    /// file lines are appended to, each `<key>[+<key>...] [<hold ms>]` (keys
+    /// by [`named`], held 150 ms when left out). A new line is pressed when
+    /// it is seen (the file is looked at every 50 ms); a file made shorter
+    /// is read again from its start.
     fn live() -> Vec<u8> {
         use std::io::{Read, Seek, SeekFrom};
         struct Live {
@@ -1270,7 +1266,7 @@ mod host {
         let Some(live) = &*LIVE else {
             return Vec::new();
         };
-        let mut live = lock(live);
+        let mut live = live.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         if live.looked.is_none_or(|at| now.duration_since(at) >= Duration::from_millis(50)) {
             live.looked = Some(now);
@@ -1283,22 +1279,25 @@ mod host {
                 && file.seek(SeekFrom::Start(live.read)).is_ok()
             {
                 let mut text = String::new();
-                let _ = file.take(len - live.read).read_to_string(&mut text);
-                // Whole lines only: a line still being written waits.
-                let whole = text.rfind('\n').map_or(0, |i| i + 1);
-                for line in text[..whole].lines() {
-                    let mut parts = line.split_whitespace();
-                    let Some(keys) = parts.next() else { continue };
-                    let hold = parts.next().and_then(|h| h.parse::<u64>().ok()).unwrap_or(150).clamp(16, 10_000);
-                    for key in keys.split('+') {
-                        match named(key) {
-                            Some(vk) => live.held.push((now + Duration::from_millis(hold), vk)),
-                            None => tracing::warn!(key, "VICTORY_INPUT_FILE: no such key"),
+                if file.read_to_string(&mut text).is_ok() {
+                    // Whole lines only: a line still being written waits.
+                    let whole = text.rfind('\n').map_or(0, |at| at + 1);
+                    live.read += whole as u64;
+                    for line in text[..whole].lines() {
+                        let mut parts = line.split_whitespace();
+                        let Some(keys) = parts.next() else {
+                            continue;
+                        };
+                        let hold = parts.next().and_then(|ms| ms.parse::<u64>().ok()).unwrap_or(150).clamp(16, 10_000);
+                        for key in keys.split('+') {
+                            match named(key) {
+                                Some(vk) => live.held.push((now + Duration::from_millis(hold), vk)),
+                                None => tracing::warn!(key, "VICTORY_INPUT_FILE: no such key"),
+                            }
                         }
+                        tracing::info!(line, "VICTORY_INPUT_FILE: pressed");
                     }
-                    tracing::info!(keys, hold, "key pressed from the input file");
                 }
-                live.read += whole as u64;
             }
         }
         live.held.retain(|&(until, _)| until > now);

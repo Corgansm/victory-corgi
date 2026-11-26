@@ -36,14 +36,21 @@ parser.add_argument(
     default=r"D:\GTA 6 Xbox Build\GTA6.Xbox.v1.0.2.1-CYBERLEEK\game_scarlett_master.exe",
     help="title executable passed to 'victory run'",
 )
-parser.add_argument("--work", default=str(Path(__file__).resolve().parent), help="folder for run logs and captures")
+parser.add_argument("--work", default=str(Path(__file__).resolve().parent), help="folder for the trigger and input files")
+parser.add_argument(
+    "--runs",
+    default="",
+    help="folder for run logs and captures (default: runs under prologue.DATA_ROOT, else under --work)",
+)
 parser.add_argument("--debug", action="store_true", help="verbose server logging to stderr")
 ARGS, _unknown = parser.parse_known_args()
 
 REPO = Path(ARGS.repo)
 GAME_EXE = Path(ARGS.game_exe)
 WORK = Path(ARGS.work)
-RUNS = WORK / "runs"
+# Run logs and captures go on the internal drive (prologue.DATA_ROOT) where there is one: a run log grows
+# to tens of megabytes and a recorded frame to a thousand files, and the system drive here is a USB disk.
+RUNS = Path(ARGS.runs) if ARGS.runs else (prologue.data_root() or WORK) / "runs"
 RUNS.mkdir(parents=True, exist_ok=True)
 DATA_DIR = Path(os.environ.get("VICTORY_DATA_DIR", Path(os.environ["LOCALAPPDATA"]) / "victory" / "data"))
 CARGO_BIN = Path(os.environ["USERPROFILE"]) / ".cargo" / "bin"

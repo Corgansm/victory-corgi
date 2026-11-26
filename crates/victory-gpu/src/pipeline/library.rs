@@ -519,10 +519,15 @@ pub(crate) fn pipeline(
     load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
+    // A pipeline with a hot shader (`super::hot`) stays out of the library:
+    // a run without one must never load it.
+    if super::hot::active() {
+        return create().inspect_err(super::hot::note_error);
+    }
     let wide = HSTRING::from(name);
     let Some(library) = library() else {
         MADE.fetch_add(1, Ordering::Relaxed);
-        return crate::apis::result(crate::apis::Api::PipelineStates, name, create());
+        return crate::apis::result(crate::apis::Api::PipelineStates, name, create().inspect_err(super::hot::note_error));
     };
     let began = std::time::Instant::now();
     let loaded = {
@@ -549,7 +554,7 @@ pub(crate) fn pipeline(
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);
-        crate::apis::result(crate::apis::Api::PipelineStates, name, create())?
+        crate::apis::result(crate::apis::Api::PipelineStates, name, create().inspect_err(super::hot::note_error))?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
