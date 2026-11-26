@@ -4,11 +4,8 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
-//! * [`hydrate`]: the diagnostics file Hydrate Shader Diagnostics reads
-//!   (`VICTORY_HYDRATE_LOG`).
 
 pub mod config;
-pub mod hydrate;
 pub mod logging;
 pub mod policy;
 

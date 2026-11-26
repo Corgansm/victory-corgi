@@ -116,8 +116,7 @@ pub(crate) fn tick() {
     let rows = BY_PIPELINE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let status = STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let rows: Vec<(String, Row)> = rows.into_iter().collect();
-    let board = board(&rows, frames, elapsed);
-    let page = page(&status, rows, &board, frames, elapsed, PAGES.fetch_add(1, Relaxed) + 1);
+    let page = page(&status, rows, frames, elapsed, PAGES.fetch_add(1, Relaxed) + 1);
     let Some(dir) = super::dir() else { return };
     // Whole or not at all for a browser that reloads meanwhile: written
     // beside and moved over; written in place where the move is refused.
@@ -125,21 +124,6 @@ pub(crate) fn tick() {
     if std::fs::write(&beside, &page).is_err() || std::fs::rename(&beside, &to).is_err() {
         let _ = std::fs::write(&to, &page);
     }
-}
-
-/// The rows of the APIs and subsystems (`crate::apis`), with the host root
-/// signatures and pipeline states the frames bound since the last page.
-fn board(rows: &[(String, Row)], frames: u64, elapsed: Duration) -> Vec<crate::apis::Row> {
-    static LAST: Mutex<Option<crate::apis::Last>> = Mutex::new(None);
-    let distinct = |f: &dyn Fn(&Row) -> usize| {
-        let mut all: Vec<usize> = rows.iter().map(|r| f(&r.1)).filter(|&p| p != 0).collect();
-        all.sort_unstable();
-        all.dedup();
-        all.len()
-    };
-    let bound = (distinct(&|r| r.objects.0), distinct(&|r| r.objects.1));
-    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::apis::board(last.get_or_insert_with(Default::default), Some(bound), frames, elapsed)
 }
 
 fn escape(text: &str) -> String {
@@ -151,7 +135,6 @@ fn escape(text: &str) -> String {
 fn page(
     status: &str,
     mut rows: Vec<(String, Row)>,
-    board: &[crate::apis::Row],
     frames: u64,
     elapsed: Duration,
     number: u64,
@@ -219,22 +202,7 @@ fn page(
         }
         out.push_str("</table></div>");
     };
-    out.push_str("<h2>APIs and subsystems</h2><table><tr><th>API or subsystem</th><th style=\"text-align:left\">tells</th><th style=\"text-align:left\">now</th></tr>");
-    for row in board {
-        let _ = write!(
-            out,
-            "<tr><td class=\"{}\">{}</td><td style=\"text-align:left\" class=\"note\">{}</td><td style=\"text-align:left;white-space:normal\">{}",
-            if row.good { "g" } else { "bad" },
-            row.api.name(),
-            row.api.tells(),
-            escape(&row.now)
-        );
-        for note in &row.notes {
-            let _ = write!(out, "<div class=\"note\">{}</div>", escape(note));
-        }
-        out.push_str("</td></tr>");
-    }
-    out.push_str("</table><div class=\"cols\">");
+    out.push_str("<div class=\"cols\">");
     if timed {
         rows.sort_by(|a, b| b.1.gpu.1.cmp(&a.1.gpu.1));
         let widest = rows.first().map_or(0.0, |r| r.1.gpu.1 as f64);
@@ -267,14 +235,7 @@ mod tests {
             ("[compute cccc]".to_owned(), row(true, 10, 9_000_000)),
             ("[vertex <x>]".to_owned(), row(false, 20, 1_000_000)),
         ];
-        use crate::apis::{Api, Row as Shown};
-        let board = [
-            Shown { api: Api::Present, now: "10 presents <now>".to_owned(), good: true, notes: Vec::new() },
-            Shown { api: Api::RemovedReason, now: "removed".to_owned(), good: false, notes: vec!["a <note>".to_owned()] },
-        ];
-        let p = page("5.5 fps, 182 ms/frame", rows.clone(), &board, 10, Duration::from_secs(2), 3);
-        assert!(p.contains("<td class=\"g\">Present</td>") && p.contains("10 presents &lt;now&gt;"));
-        assert!(p.contains("<td class=\"bad\">GetDeviceRemovedReason</td>") && p.contains("<div class=\"note\">a &lt;note&gt;</div>"));
+        let p = page("5.5 fps, 182 ms/frame", rows.clone(), 10, Duration::from_secs(2), 3);
         assert!(p.contains("32 draws with 2 graphics pipelines, 1 dispatches with 1 compute pipelines"));
         assert!(p.contains("binding them took the recording threads 1.3 ms a frame"));
         assert!(p.contains("needs a timing run"));
@@ -288,7 +249,7 @@ mod tests {
         // a timing run adds the card's column and table
         let mut timed = rows;
         timed[1].1.gpu = (10, 45_000);
-        let p = page("", timed, &[], 10, Duration::from_secs(2), 4);
+        let p = page("", timed, 10, Duration::from_secs(2), 4);
         assert!(p.contains("Heaviest on the card") && p.contains("<th>card ms</th>") && p.contains("<td>4.50</td>"));
         assert!(p.contains("the frame line has not come yet"));
     }

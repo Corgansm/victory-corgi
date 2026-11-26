@@ -1,0 +1,53 @@
+# Starts the title with the settings this fork is played with (README.md, "How to run it").
+#   scripts\play.ps1 -Exe <path of your own copy's executable>
+# -Safe         without the newer, faster ways (the first thing to try when something is wrong)
+# -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
+# -Build        target\diag (the default, the build all measurements are of) or target\release
+# -More         other settings: -More @{VICTORY_PANEL='1'}
+# -WideIndirect NVIDIA: indirect dispatches past 65,535 groups as on AMD (no blocky patches at the
+#               bottom of the picture). Off by default: only for a card the wide-dispatch test passed on.
+# -Exact        what the card writes and what the title copies reach the right submission: results
+#               fetched while the next flight is at the same bytes are put right (VICTORY_FETCH_CHECK=1),
+#               and every title buffer's copy has a side on the card (VICTORY_CARD_ALL=1), so a
+#               submission in the air never reads a later one's bytes. Without them 3 of the relay
+#               tests fail (host::upcheck, VICTORY_RELAY=2 VICTORY_RELAY_COPY=1); with them all pass on
+#               an RTX 4090 Laptop GPU. Cost not yet measured in a session: some CPU time on the
+#               landing threads (3-4 ms over 96 MB, upstream's estimate) and more card memory.
+# The device is made on the high-performance GPU (the NVIDIA card of a laptop, not the Intel one);
+# -More @{VICTORY_GPU='default'} goes back to the first adapter.
+# Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
+param(
+    [Parameter(Mandatory)][string]$Exe,
+    [switch]$Safe,
+    [switch]$RayTracing,
+    [switch]$WideIndirect,
+    [switch]$Exact,
+    [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [hashtable]$More = @{}
+)
+$settings = @{
+    VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
+    VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
+    VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
+    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+}
+if ($Safe) {
+    $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
+} else {
+    $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+}
+if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($WideIndirect) { $settings.VICTORY_INDIRECT_WIDE = 'force' }
+if ($Exact) { $settings.VICTORY_FETCH_CHECK = '1'; $settings.VICTORY_CARD_ALL = '1' }
+foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+
+$victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
+if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }
+if (-not (Test-Path $Exe)) { Write-Host "No $Exe."; return }
+# (Other settings left over in this window go; where your files are stays.)
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
+foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+$Exe = (Resolve-Path $Exe).Path
+Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
+try { & $victory run $Exe --execute } finally { Pop-Location }

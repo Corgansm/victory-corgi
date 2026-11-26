@@ -39,11 +39,11 @@ pub(crate) fn listed(n: u64) -> bool {
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
-    // the 80th (Grand Theft Auto VI opens with a cutscene made in the
+    // the 80th (the title opens with a cutscene made in the
     // engine: later shots of it, in case the first is dark by design).
     //
     // `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted
-    // from that first one (Grand Theft Auto VI's blue patches show from
+    // from that first one (the title's blue patches show from
     // about the 118th frame on, when the window's model has arrived and
     // the reflections hold values: none of the four above has them).
     static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
@@ -70,13 +70,12 @@ pub(crate) fn listed(n: u64) -> bool {
 /// stays empty.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
-    use std::fmt::Write as _;
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
         // it starts (`before-world-ops.txt`): what the title drew just
-        // before (Grand Theft Auto VI shows a title card there, whose text
+        // before (the title shows a title card there, whose text
         // did not show).
         if world_on() && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
             // At most 300 lines of a frame: the world's first frame alone
@@ -107,6 +106,22 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     };
     static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
     let what = what();
+    // the debugger's numbers for the operation: its pixel reads and its shader trace
+    // (the tag of a traced shader's bind goes to the draw or dispatch, not to a copy
+    // made while binding)
+    let runs = ["draw", "indexed", "mesh", "dispatch", "indirect"].iter().any(|k| what.starts_with(k));
+    let op = crate::debugger::pixel::current_op();
+    let tag = if runs { crate::debugger::trace::current_tag() } else { 0 };
+    let mut what = what;
+    {
+        use std::fmt::Write as _;
+        if op != 0 {
+            let _ = write!(what, " [op {op}]");
+        }
+        if tag != 0 {
+            let _ = write!(what, " [tag {tag}]");
+        }
+    }
     let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
     if file.as_ref().is_none_or(|f| f.0 != frame) {
         let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
@@ -116,19 +131,6 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     }
     if let Some((_, n, f)) = file.as_mut() {
         *n += 1;
-        // the debugger's numbers for the operation: its pixel reads and its shader trace
-        // (the tag of a traced shader's bind goes to the draw or dispatch, not to a copy
-        // made while binding)
-        let runs = ["draw", "indexed", "mesh", "dispatch", "indirect"].iter().any(|k| what.starts_with(k));
-        let op = crate::debugger::pixel::current_op();
-        let tag = if runs { crate::debugger::trace::current_tag() } else { 0 };
-        let mut what = what;
-        if op != 0 {
-            let _ = write!(what, " [op {op}]");
-        }
-        if tag != 0 {
-            let _ = write!(what, " [tag {tag}]");
-        }
         let _ = writeln!(f, "{n} list {list:#x} {what}");
     }
 }
@@ -144,22 +146,6 @@ const RING_LINES: usize = 6000;
 fn world_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
-}
-
-/// Every how many world frames a picture is saved with
-/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
-///
-/// A saved frame is read back at once and written as a PNG inside the
-/// present: run 225's frame log has every saved frame of the cell at 371 ms
-/// against a usual 136 (the present's own copy and show 137 ms instead of
-/// 2, and 123 ms more waiting for the card). At every 8th frame that was
-/// the regular dip of every test run, and a fifth of its time. A run that
-/// measures speed asks for 64 or more.
-fn world_every() -> u64 {
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
-    })
 }
 
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
@@ -193,7 +179,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     // (the debugger's folder alone: only its recordings)
     let own = std::env::var_os("VICTORY_CAPTURE").is_some();
     folder().is_some() && (own && (n.is_power_of_two() || before_world || in_world) || listed(n))
@@ -222,6 +208,27 @@ pub(crate) fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: b
             }
         }
     }
+    let png = encode(w, h, &raw);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::write(&path, png) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// A PNG of `width * height` pixels of 8-bit RGB.
+pub(crate) fn png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+    let row = width as usize * 3;
+    let mut raw = Vec::with_capacity((row + 1) * height as usize);
+    for line in rgb.chunks_exact(row.max(1)) {
+        raw.push(0);
+        raw.extend_from_slice(line);
+    }
+    encode(width, height, &raw)
+}
+
+/// A PNG of rows of RGB, each behind its filter byte.
+fn encode(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
     header.extend(w.to_be_bytes());
@@ -229,15 +236,11 @@ pub(crate) fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: b
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
     let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
-    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
     debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -385,9 +388,7 @@ static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::Hos
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        folder().is_some() && (std::env::var_os("VICTORY_DUMP_TARGETS").is_some() || crate::debugger::on())
-    })
+    *ON.get_or_init(|| folder().is_some() && (crate::switch::on("VICTORY_DUMP_TARGETS") || crate::debugger::on()))
 }
 
 /// Notes a title texture the frame being built renders to or writes.

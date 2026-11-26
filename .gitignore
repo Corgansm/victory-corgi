@@ -10,8 +10,6 @@
 # Build output
 /target/
 /tests/fixtures/*/target/
-/build*.log
-/diag-run.*
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
@@ -78,21 +76,3 @@
 *.swp
 Thumbs.db
 .DS_Store
-/1/
-/1/
-/1/
-/1/
-/_debugger/
-/git
-/_debugger/
-/1/
-*.png
-*.jpg
-*.jpeg
-*.webp
-/_debugger/
-/1/
-*.png
-*.jpg
-*.jpeg
-*.webp

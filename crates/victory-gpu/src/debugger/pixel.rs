@@ -105,7 +105,26 @@ pub(super) fn arm(frame: u64) {
 
 /// Whether the frame being built reads the pixel.
 fn active() -> bool {
-    FRAME.load(Relaxed) != u64::MAX && super::recording() && super::pick().is_some()
+    probes_on() && FRAME.load(Relaxed) != u64::MAX && super::recording() && super::pick().is_some()
+}
+
+/// Whether a recording reads the picked pixel at all (`VICTORY_DEBUGGER_PROBES=1`;
+/// off by default in this tree), and then only from colour render targets.
+///
+/// Each read moves the texture to the copy-source state and back in the middle of the
+/// title's list. Read from every texture an operation writes (render targets,
+/// unordered-access textures, the colour twins of depth textures) it hung the card
+/// here twice, both times in a recording with a picked pixel (runs 20261125-194002,
+/// frame 2275; 20261125-203230, frame 3828; 0x887A0006), where a recording without
+/// one ran clean (frame 4463). Without them a recording makes no state change inside
+/// the title's lists.
+pub(crate) fn probes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DEBUGGER_PROBES").is_some_and(|v| v == "1");
+        tracing::info!(on, "debugger: the picked pixel's history (VICTORY_DEBUGGER_PROBES=1: colour render targets only)");
+        on
+    })
 }
 
 /// A texture the operation being bound writes through unordered access.
@@ -141,13 +160,11 @@ pub(crate) fn before(list: &HostList, targets: &[(usize, u32)], label: impl FnOn
     if !active() {
         return None;
     }
-    const UNORDERED_ACCESS: u32 = 0x8;
-    let mut all: Vec<(usize, u32)> = targets.to_vec();
-    for u in uavs {
-        if !all.iter().any(|t| t.0 == u) {
-            all.push((u, UNORDERED_ACCESS));
-        }
-    }
+    // Colour render targets only, in the state they are bound in ([`probes_on`]):
+    // textures written through unordered access are not read.
+    const RENDER_TARGET: u32 = 0x4;
+    drop(uavs);
+    let all: Vec<(usize, u32)> = targets.iter().copied().filter(|&(_, state)| state == RENDER_TARGET).collect();
     let op = OPS.fetch_add(1, Relaxed) + 1;
     CURRENT.with(|c| c.set(op));
     let label = label();
@@ -188,16 +205,8 @@ fn read(list: &HostList, t: usize, state: u32, op: u64, label: &str, after: bool
     }
     // A depth texture a shader writes through unordered access: what it writes are its
     // colour twins (the depth plane's, the stencil plane's), each a target of its own.
+    // Depth textures and their colour twins are not read ([`probes_on`]).
     if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
-        const UNORDERED_ACCESS: u32 = 0x8;
-        if state == UNORDERED_ACCESS {
-            let x = ((pick.0 * d.Width as f32) as u32).min(d.Width as u32 - 1);
-            let y = ((pick.1 * d.Height as f32) as u32).min(d.Height - 1);
-            list.with_twins_readable(t as This, |twin, view| {
-                let id = windows::core::Interface::as_raw(twin) as usize;
-                probe(list, twin, view, id, (d.Width, d.Height), (x, y), Some((op, label, after)));
-            });
-        }
         return;
     }
     let x = ((pick.0 * d.Width as f32) as u32).min(d.Width as u32 - 1);
@@ -370,13 +379,19 @@ fn make_depth_pass() -> windows::core::Result<DepthPass> {
     }
 }
 
+/// Whether a draw's depth texture is read at the picked pixel. Off in this tree:
+/// the pass of ours and the move of the depth texture it needs are what
+/// [`probes_on`] keeps out of the title's lists.
+const DEPTH_READS: bool = false;
+
 /// Before a draw binds anything (diagnostics): reads the picked texel of depth target
 /// `depth`'s depth plane, as it is before the draw, into the pixel history. True if it
 /// recorded our pass: it set a pipeline, root signature and heaps of ours, which the
 /// caller then sets again.
 pub(crate) fn depth(list: &HostList, depth: usize) -> bool {
     const NON_PIXEL_SHADER_RESOURCE: u32 = 0x40;
-    if !active() {
+    // Not in this tree ([`DEPTH_READS`]).
+    if !DEPTH_READS || !active() {
         return false;
     }
     let Some(pick) = super::pick() else { return false };

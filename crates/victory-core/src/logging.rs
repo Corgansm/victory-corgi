@@ -4,9 +4,6 @@
 //! `VICTORY_LOG=victory_loader=trace,info`. Debug and trace output exist
 //! only in builds with the `diagnostics` feature; a plain release build
 //! logs info and above whatever the filter asks for.
-//!
-//! `VICTORY_HYDRATE_LOG=<file>` also appends the graphics warnings and
-//! errors to a file Hydrate Shader Diagnostics reads ([`crate::hydrate`]).
 
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -29,8 +26,6 @@ pub fn init(default_level: &str) {
     let _ = tracing_subscriber::registry()
         .with(CAP)
         .with(filter)
-        // `VICTORY_HYDRATE_LOG`: the lines Hydrate has categories for, to its file too.
-        .with(crate::hydrate::layer())
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)

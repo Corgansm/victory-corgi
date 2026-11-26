@@ -95,6 +95,22 @@ fn picture(host: &crate::resource::HostTexture, path: &std::path::Path) -> bool 
     if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.SampleDesc.Count > 1 {
         return false;
     }
+    // Only textures the card never writes. A render target, depth or
+    // unordered-access texture is read in a list of this function's own,
+    // submitted at once outside the queues' order: the state the host
+    // notes for it may be one the card has not reached yet (lists sent
+    // ahead, the relay and second queues), and a state change on such a
+    // texture rewrites its compression data. In this tree that drew black
+    // lines across the picture and took the people's hair (drawn through
+    // unordered access) after F11 (run 20261125-202248). Every target a
+    // recorded frame draws is saved anyway (`crate::capture::dump_targets`).
+    let written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+        | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
+        | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+        | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    if d.Flags.0 & written.0 != 0 {
+        return false;
+    }
     let mut mip = 0u32;
     while mip + 1 < u32::from(d.MipLevels) && ((d.Width >> (mip + 1)) >= 64 && (d.Height >> (mip + 1)) >= 64) {
         mip += 1;

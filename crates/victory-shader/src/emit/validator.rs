@@ -27,15 +27,6 @@ const IID_IDXC_VALIDATOR: Guid = Guid(
     0x4826,
     [0x98, 0x11, 0x28, 0x57, 0xe7, 0x97, 0xf4, 0x9a],
 );
-/// `IDxcVersionInfo`, which the validator object also answers to.
-const IID_IDXC_VERSION_INFO: Guid = Guid(
-    0xb04f_5b50,
-    0x2059,
-    0x4f12,
-    [0xa8, 0xff, 0xa1, 0xe0, 0xcd, 0xe1, 0xcc, 0x7e],
-);
-/// The code page `IDxcBlobEncoding::GetEncoding` gives for UTF-16.
-const UTF16: u32 = 1200;
 /// `DxcValidatorFlags_InPlaceEdit`: sign the container we pass.
 const IN_PLACE_EDIT: u32 = 1;
 
@@ -170,27 +161,6 @@ impl Validator {
         }
     }
 
-    /// The validator's own version (`IDxcVersionInfo::GetVersion`), which
-    /// says what it knows to check: a result is only as good as it. `None`
-    /// if the object does not say.
-    pub fn version(&self) -> Option<(u32, u32)> {
-        // SAFETY: IUnknown::QueryInterface (slot 0) of our object, then
-        // IDxcVersionInfo::GetVersion (slot 3) of the one it gives.
-        unsafe {
-            let query: unsafe extern "system" fn(Object, *const Guid, *mut Object) -> Hresult =
-                method(self.object, 0);
-            let mut info: Object = std::ptr::null_mut();
-            if query(self.object, &IID_IDXC_VERSION_INFO, &mut info) < 0 || info.is_null() {
-                return None;
-            }
-            let get: unsafe extern "system" fn(Object, *mut u32, *mut u32) -> Hresult = method(info, 3);
-            let (mut major, mut minor) = (0, 0);
-            let hr = get(info, &mut major, &mut minor);
-            release(info);
-            (hr >= 0).then_some((major, minor))
-        }
-    }
-
     /// Validates `container` and signs it in place; the error text if it
     /// is rejected.
     pub fn validate(&mut self, container: &mut [u8]) -> Result<(), String> {
@@ -217,11 +187,7 @@ impl Validator {
             let mut status = 0;
             let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
-            let asked = get_status(result, &mut status);
-            if asked < 0 {
-                release(result);
-                return Err(format!("the validator gave no status: {asked:#x}"));
-            }
+            get_status(result, &mut status);
             let mut text = String::new();
             if status < 0 {
                 let mut errors: Object = std::ptr::null_mut();
@@ -231,20 +197,10 @@ impl Validator {
                     let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
                     let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
                     let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
-                    // IDxcBlobEncoding::GetEncoding (slot 5): the text is
-                    // UTF-8 unless the blob says UTF-16.
-                    let encoding: unsafe extern "system" fn(Object, *mut i32, *mut u32) -> Hresult =
-                        method(errors, 5);
-                    let (mut known, mut page) = (0, 0);
-                    let wide = encoding(errors, &mut known, &mut page) >= 0 && known != 0 && page == UTF16;
-                    let decoded = if wide {
-                        let units: Vec<u16> =
-                            bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
-                        String::from_utf16_lossy(&units)
-                    } else {
-                        String::from_utf8_lossy(bytes).into_owned()
-                    };
-                    text = decoded.trim_end_matches('\0').trim().into();
+                    text = String::from_utf8_lossy(bytes)
+                        .trim_end_matches('\0')
+                        .trim()
+                        .into();
                     release(errors);
                 }
                 if text.is_empty() {
