@@ -1017,6 +1017,8 @@ pub fn set_host_rdna(on: bool) {
 thread_local! {
     /// A test's choice for [`host_rdna`], for its thread only.
     pub(super) static TEST_RDNA: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`legacy_short`], for its thread only.
+    pub(super) static TEST_LEGACY_SHORT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The bits of [`super::rdna`] that count on this host.
@@ -1026,6 +1028,18 @@ pub(super) fn host_rdna() -> u32 {
         return bits;
     }
     if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+}
+
+/// Whether the console's legacy products take the shorter exact forms on
+/// hosts that are not RDNA ([`Lower::legacy_mul`]; `VICTORY_LEGACY_SHORT=0`:
+/// not). A switch the shader cache keys on (`crate` users list it).
+pub fn legacy_short() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LEGACY_SHORT.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_SHORT").is_none_or(|v| v != "0"))
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -4192,8 +4206,39 @@ impl<'a> Lower<'a> {
             let z = self.s.m.cmp(c, pred::OEQ, asked, zero);
             return self.s.m.select(c, z, zero, m);
         }
+        // Other hosts: the same bits as the console, with fewer instructions
+        // where the factors allow. A product differs from the console's only
+        // where a factor is 0: the console's is +0, the host's 0 has the sign
+        // of the product, or is no number where the other factor is an
+        // infinity or no number. So:
+        // - a value by itself: the host's square is +0 at 0 already;
+        // - two finite factors, or a finite constant that is not 0: only the
+        //   sign of a zero product differs, and adding +0 makes it +0 (the
+        //   host keeps `x + 0.0`: a -0 becomes +0, every other value stays);
+        // - one finite factor: one comparison, of that one (the other may be
+        //   an infinity), and the sum for the sign.
+        // Each comparison and selection was an instruction on the card in
+        // the title's hottest shaders (pixel 398971d1222d8f95: 1,019
+        // comparisons with zero, most of them for this). `VICTORY_LEGACY_SHORT=0`:
+        // two comparisons everywhere, as before.
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
+        if legacy_short() {
+            if a == b {
+                return m;
+            }
+            let (fa, fb) = (self.s.m.bounded(a, 12).is_some(), self.s.m.bounded(b, 12).is_some());
+            let not_zero = |l: &Self, x: V| l.s.m.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite());
+            if fa && fb || not_zero(self, a) || not_zero(self, b) {
+                return self.s.m.bin(c, Bin::Add, m, zero);
+            }
+            if fa || fb {
+                let finite = if fa { a } else { b };
+                let z = self.s.m.cmp(c, pred::OEQ, finite, zero);
+                let r = self.s.m.select(c, z, zero, m);
+                return self.s.m.bin(c, Bin::Add, r, zero);
+            }
+        }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);

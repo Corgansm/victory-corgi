@@ -92,6 +92,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     }
     // SAFETY: just mapped, and no title code has run.
     let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };
+    // SAFETY: as above; the image stays mapped.
+    if unsafe { crate::hooks::live_render_scale(loaded.base(), &prepared.original_hash) } {
+        tracing::info!("live render scale: the live menus set it (VICTORY_LIVE_FILE)");
+    }
     if levers > 0 {
         tracing::warn!(
             applied = levers,

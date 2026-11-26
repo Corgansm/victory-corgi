@@ -112,6 +112,11 @@ fn air() -> f32 {
     })
 }
 
+/// [`air`], or what the live menus set (`crate::live`).
+fn air_now() -> f32 {
+    crate::live::get(crate::live::AIR).unwrap_or_else(air)
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -429,15 +434,17 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
+    // (The live menus change the level, `crate::live`.)
+    let live = crate::live::get(crate::live::AMBIENT);
     let (level, constant) = match set() {
         Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
+        Set::Estimate(level) => (live.unwrap_or(level), 0.0f32),
+        Set::Constant(level) => (0.0, live.unwrap_or(level)),
     };
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && (constant > 0.0 || air_now() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -450,7 +457,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let [strength, radius] = shade();
+    let [mut strength, mut radius] = shade();
+    if let Some(v) = crate::live::get(crate::live::SHADE_STRENGTH) {
+        strength = v;
+    }
+    if let Some(v) = crate::live::get(crate::live::SHADE_RADIUS) {
+        radius = v;
+    }
     let floats = [level, constant, strength, radius, 0.1, 0.45];
     let mut words = [0u32; 12];
     for (to, v) in words.iter_mut().zip(floats) {
@@ -460,7 +473,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
-    words[10] = air().to_bits();
+    words[10] = air_now().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states

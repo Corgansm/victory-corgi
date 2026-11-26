@@ -2088,9 +2088,15 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
+            // Windows turned down for the card's budget lately ask for room
+            // too: idle copies go after seconds rather than minutes, until
+            // the windows fit (`crate::shadow::window_room_wanted`). Not in
+            // the queue's own line (`room`): a texture to be drawn comes
+            // before a window, an idle one after.
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept()
+                + crate::shadow::window_room_wanted();
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -2128,6 +2134,9 @@ pub(crate) fn let_go_idle() {
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
+    // Title memory looked at for copies of placed textures idle for a while
+    // but not yet for `idle_ms` (see `UNMAPPED_MS`), at most so many a look.
+    let mut asked = 0;
     let began = std::time::Instant::now();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
         if bytes >= most {
@@ -2142,13 +2151,38 @@ pub(crate) fn let_go_idle() {
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0 || !fills(&r.desc) || crate::texture::host_wrote(at) {
             continue;
+        }
+        // A placed texture whose title memory the title has let go of: its
+        // copy shows what is not there any more and goes after a short idle
+        // time, however much room the card has. While the card has room,
+        // copies are kept ten minutes ([`crate::host::vram_keep`]): the
+        // copies of textures the streaming had dropped piled up for that
+        // long, 1.5 GB of them in run 20261126-053901 ("host copies of
+        // placed textures whose title memory is not mapped any more"), and
+        // with the card full they lie in the PC's memory (SHARED 7 GB),
+        // which was down to 0.3-1.5 GB free. A texture mapped there again
+        // later is made and uploaded anew, as any let go.
+        let mut wait_ms = idle_ms;
+        if !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if idle_ms <= UNMAPPED_MS
+                || asked >= UNMAPPED_ASKED
+                || !r.host.placed.load(Relaxed)
+                || !crate::host::long_ago(used, UNMAPPED_MS, IDLE_FRAMES)
+            {
+                continue;
+            }
+            asked += 1;
+            if crate::texture::committed(r.data().cast_const(), 1) {
+                continue;
+            }
+            wait_ms = UNMAPPED_MS;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), wait_ms, IDLE_FRAMES)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2164,6 +2198,10 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            if wait_ms < idle_ms {
+                UNMAPPED_GONE[0].fetch_add(1, Relaxed);
+                UNMAPPED_GONE[1].fetch_add(host.bytes, Relaxed);
+            }
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -2188,6 +2226,20 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// How long a copy of a placed texture whose title memory is not mapped any
+/// more stays idle before [`let_go_idle`] lets it go, and how many such
+/// questions about title memory one look asks at most (each is a question
+/// to the kernel about one page).
+#[cfg(windows)]
+const UNMAPPED_MS: u64 = 5_000;
+#[cfg(windows)]
+const UNMAPPED_ASKED: u32 = 256;
+
+/// Since the start: copies of placed textures let go because their title
+/// memory was not mapped any more (before their idle time), and their bytes.
+#[cfg(windows)]
+pub(crate) static UNMAPPED_GONE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.

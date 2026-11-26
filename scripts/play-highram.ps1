@@ -33,9 +33,10 @@ $settings = @{
     VICTORY_F16_NEAREST = '1'
     # The paired form (fxceless PR 854) for the two programs NVIDIA refused that draw right in
     # it: the alpha transmission prefilter (no blue blocks in the sky) and particle visibility.
-    # The water's transmission volumetrics in that form draw dark slabs on the water: left
-    # out (VICTORY_PAIRED_ONLY lists DXBC digests; unset = every program NVIDIA refuses).
-    VICTORY_PAIRED_ONLY = 'b5b838548eaa4050638308fb2c805641,2431bbe7dc154ad759d20bc954829c1c'
+    # (VICTORY_PAIRED_ONLY lists DXBC digests; unset = every program NVIDIA refuses.)
+    # The water: its tile classifier (581dab2c) and the three passes that shade its tiles take the
+    # paired form together (the classifier alone listed tiles nothing shaded: dark slabs).
+    VICTORY_PAIRED_ONLY = 'b5b838548eaa4050638308fb2c805641,2431bbe7dc154ad759d20bc954829c1c,581dab2cd8bc,50cf28328b58,24126c14dc76,7099a57fded1'
     # Frame rate and frame time on the picture, upper left (F3 shows and hides it).
     VICTORY_PANEL = '1'
     # One recording thread. With the title's list calls on threads of their own (VICTORY_THIN=1)

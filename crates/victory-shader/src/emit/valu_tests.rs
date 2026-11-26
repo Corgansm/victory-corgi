@@ -2116,6 +2116,58 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
     }
 }
 
+/// On any host the shorter forms of the console's legacy products
+/// ([`lower::legacy_short`]) give the same bits as two comparisons: a zero
+/// product is +0, 0 times an infinity or no number is +0, and the rest is
+/// the host's product (a square, finite factors, a constant factor, one
+/// factor known finite, a multiply-add).
+#[test]
+fn short_legacy_products_give_the_consoles_bits() {
+    const MINUS_ONE: u16 = 243;
+    const HALF: u16 = 240;
+    let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
+    let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
+    // v5 = v1 as a float made from an integer (finite), then the products.
+    let finite = vop1(0x005, 5, a);
+    let with_finite = |y: [u32; 2]| [vec![finite], y.to_vec()].concat();
+    let bodies: [(&str, Vec<u32>); 8] = [
+        ("mul_legacy", vop3(0x107, 0, a, b, 0).to_vec()),
+        ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec()),
+        ("mul_legacy by -1", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec()),
+        ("mul_legacy by 0.5", vop3(0x107, 0, HALF, a, 0).to_vec()),
+        ("mul_legacy of a finite one", with_finite(vop3(0x107, 0, vgpr(5), b, 0))),
+        ("mul_legacy of two finite ones", with_finite(vop3(0x107, 0, vgpr(5), vgpr(5), 0))),
+        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec()),
+        ("mad_legacy after a product", two(vop3(0x107, 5, a, b, 0), vop3(0x140, 0, vgpr(5), c, a))),
+    ];
+    let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    let mut cases = Vec::new();
+    for (i, x) in numbers.iter().enumerate() {
+        for (j, y) in numbers.iter().enumerate() {
+            let z = numbers[(3 * i + j) % numbers.len()];
+            cases.push([x.to_bits(), y.to_bits(), z.to_bits(), 0]);
+        }
+    }
+    for (name, body) in bodies {
+        let mut got: Vec<Vec<u32>> = Vec::new();
+        for short in [false, true] {
+            lower::TEST_RDNA.set(Some(0));
+            lower::TEST_LEGACY_SHORT.set(Some(short));
+            let shader = build_valu_cs(&body);
+            lower::TEST_LEGACY_SHORT.set(None);
+            lower::TEST_RDNA.set(None);
+            let mut all = Vec::new();
+            run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, _, r| all.push(r));
+            got.push(all);
+        }
+        for (case, (&was, &is)) in cases.iter().zip(got[0].iter().zip(&got[1])) {
+            let (x, y) = (f32::from_bits(was), f32::from_bits(is));
+            let same = was == is || x.is_nan() && y.is_nan();
+            assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
+        }
+    }
+}
+
 /// A program that moves a typed buffer's 16-bit channels
 /// (`buffer_load_format_d16_xyzw` from the table's first view,
 /// `buffer_store_format_d16_xyzw` to its second) names both places for the

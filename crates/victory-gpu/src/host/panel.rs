@@ -319,6 +319,11 @@ impl Panel {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
+        // The live menus' switch (`crate::live`), when it changes.
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if let Some(v) = crate::live::fresh(crate::live::PANEL, &SEEN) {
+            shown().store(v >= 0.5, Ordering::Relaxed);
+        }
         if !shown().load(Ordering::Relaxed) {
             self.frames = 0;
             return;

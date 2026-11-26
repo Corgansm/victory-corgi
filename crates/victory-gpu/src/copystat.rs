@@ -869,7 +869,7 @@ fn log_memory() {
     let views = crate::descriptor::views_kept();
     let own: Vec<u64> = (0..8).map(owned).collect();
     tracing::info!(
-        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
+        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB, {} freed unused in {} looks; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
         alive[0],
         alive[1],
         mb(alive[2]),
@@ -890,6 +890,8 @@ fn log_memory() {
         views[0],
         views[1],
         mb(views[2]),
+        views[8],
+        views[9],
         mb(own[..4].iter().sum()),
         own[4..].iter().sum::<u64>(),
         mb(own[0]),
@@ -912,7 +914,8 @@ fn log_memory() {
          made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
          lists were made; twins of depth textures: {:.0} MB; host copies of \
          placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
-         them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
+         them still shown by a descriptor slot {:.0} MB, let go for that since the start {} \
+         ({:.0} MB); the pipeline library's mapped file \
          let go from memory so far: {:.0} MB; our own blocks of 32 MB and more, in MB: {}",
         views[6],
         views[7],
@@ -925,6 +928,8 @@ fn log_memory() {
         mb(census[7]),
         mb(census[8]),
         mb(census[9]),
+        crate::resource::UNMAPPED_GONE[0].load(Relaxed),
+        mb(crate::resource::UNMAPPED_GONE[1].load(Relaxed)),
         mb(kept[6]),
         big_blocks(),
     );

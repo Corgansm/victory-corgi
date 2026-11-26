@@ -39,6 +39,20 @@ form, which here melted the picture: they keep their earlier translation. Float 
 tell NaN by its bits (`VICTORY_NAN_EXACT`), as NVIDIA's driver may fold a compare's NaN case
 away. The frame rate shows on the picture (`VICTORY_PANEL=1`, F3 hides it).
 
+Later the same day: **turquoise water.** The program taken for the water's volumetrics
+(DXBC digest `581dab2c...`) is its tile classifier: a wave per 8x8 tile, which lists the
+tiles the water's passes then shade. Three of those passes (`50cf2832...`, `24126c14...`,
+`7099a57f...`) were refused by NVIDIA's driver as well. The classifier alone in the paired
+form listed tiles their passes never shaded: the dark slabs at piers and islands. All four
+left out: no tiles, dark navy water everywhere. All four in the paired form
+(`VICTORY_PAIRED_ONLY`): the water as on the console.
+
+`VICTORY_PIECE_KB` (4, 8, 16, 32 or 64; 64 by default): the size of the pieces in which what
+shaders wrote to host copies on the card is compared, fetched and landed. Smaller pieces fetch
+less around a few bytes written. With `VICTORY_FETCH_CHECK=1` a landed range that spanned
+several pieces read past its piece in the fetch (`land::ordered` joins ranges within 64 KiB):
+the card hung at the first load with any size but 64; the ranges are now cut at pieces.
+
 Also new: **no more melting.** With the title's list calls recorded on threads of their own
 (`VICTORY_THIN=1`, the base fork's default), NVIDIA's capped descriptor pool ran full: about
 500 descriptor tables a frame refused and 300 indirect draws dropped, so the water went

@@ -1220,6 +1220,11 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// A pass of ours set the list's pipeline, root signature, heaps and
+    /// targets in the middle of the title's commands
+    /// ([`HostList::plane_before_use`]): the title's are set again before
+    /// its next draw or dispatch ([`HostList::take_state_lost`]).
+    state_lost: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1588,6 +1593,19 @@ fn record_plane_pass(
         }
     }
 }
+
+/// Whether a depth plane's twin is drawn into the plane ahead of its next
+/// use in the list that wrote the twin ([`HostList::plane_before_use`]);
+/// `VICTORY_PLANE_EARLY=0`: when the list closes, as before.
+fn plane_early() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_EARLY").is_none_or(|v| v != "0"))
+}
+
+/// Depth planes drawn from their twins ahead of a draw in the list that
+/// wrote the twin ([`HostList::plane_before_use`]), since the last
+/// frame-rate line.
+static PLANES_EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A list's prelude to record ([`HostList::prelude_plan`]): the prelude's allocator and list,
 /// the transitions into the copy states, the twin copies, the transitions to the states
@@ -2072,6 +2090,10 @@ struct CardWork {
     /// One dword per piece compared, odd where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
+    /// Beside it, one dword per piece whose bits say which of its 4 KiB
+    /// parts differ (`crate::shadow::fetch_parts`; the compare writes it
+    /// only then, and it is read only where `differs` flags the piece).
+    marks: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
     /// The dwords of `differs` taken by plans whose results were not read
@@ -2100,7 +2122,7 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// 82 on the card (capture replay1, 405 of them), most of it waiting for
 /// those steps.
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1), UAV(u2)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -2111,10 +2133,48 @@ cbuffer Span : register(b0) {
 };
 ByteAddressBuffer now : register(t0);
 // 16 bytes per piece of the copy: the hash of its bytes when they were
-// last sent up (or hashed whole, the first time).
+// last sent up (or hashed whole, the first time). With FINE, 144: those 16
+// and 8 more for each of the piece's sixteen 4 KiB parts
+// (`shadow::card_hash_bytes`).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+// With FINE: one dword a piece, bit s set where its 4 KiB part s differs
+// from the hash stored for it. Only read where `differs` flags the piece.
+RWByteAddressBuffer marks : register(u2);
+#if FINE
+#define STRIDE 144u
+#else
+#define STRIDE 16u
+#endif
 groupshared uint4 parts[64];
+#if FINE
+// Each thread's hash of each of the sixteen parts: 8 KiB of the group's
+// own memory, and the reason FINE is a build of its own rather than a
+// switch in this one (unused groupshared still costs occupancy).
+groupshared uint2 fines[16 * 64];
+groupshared uint found;
+#endif
+static const uint4 SEED = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+static const uint4 MUL = uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+uint4 mix4(uint4 h, uint4 v) {
+    uint4 x = (h ^ v) * MUL;
+    return x.yzwx ^ (x >> 15);
+}
+#if FINE
+// A part's 64 bits. Every dword of the sixteen bytes reaches both halves,
+// so a change in any one of them changes the hash; two changes that cancel
+// in both halves at once are what the 64 bits are for.
+uint2 mix2(uint2 h, uint4 v) {
+    uint a = v.x ^ (v.y * 0x9E3779B1u) ^ (v.z * 0x85EBCA77u) ^ (v.w * 0xC2B2AE3Du);
+    uint b = v.w ^ (v.z * 0x27D4EB2Fu) ^ (v.y * 0x165667B1u) ^ (v.x * 0x1B873593u);
+    uint2 x = (h ^ uint2(a, b)) * uint2(0x01000193u, 0x9E3779B1u);
+    return uint2(x.y ^ (x.x >> 15), x.x ^ (x.y >> 13));
+}
+uint2 join2(uint2 h, uint2 v) {
+    uint2 x = (h ^ v) * uint2(0x01000193u, 0x9E3779B1u);
+    return uint2(x.y ^ (x.x >> 15), x.x ^ (x.y >> 13));
+}
+#endif
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
@@ -2124,59 +2184,110 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) + thread;
-    uint at = lo + thread * 16u;
-    // Eight loads at once: one after the other, each waits for memory.
+    uint kept = piece * STRIDE;
+#if FINE
+    if (thread == 0u) found = 0u;
+    GroupMemoryBarrierWithGroupSync();
+#endif
+    uint4 h = SEED + thread;
+    // Two 4 KiB parts at a time: eight loads one after the other, as each
+    // waits for memory. The addresses, and the order the piece's hash takes
+    // them in, are those of the one pass this grew out of, so the hash of a
+    // piece is the same value as before (`torn` reads it, and `torn::hash`
+    // makes the same on the CPU).
     [loop]
-    for (; at + 7168u < hi; at += 8192u) {
-        uint4 v0 = now.Load4(at + 0u);
-        uint4 v1 = now.Load4(at + 1024u);
-        uint4 v2 = now.Load4(at + 2048u);
-        uint4 v3 = now.Load4(at + 3072u);
-        uint4 v4 = now.Load4(at + 4096u);
-        uint4 v5 = now.Load4(at + 5120u);
-        uint4 v6 = now.Load4(at + 6144u);
-        uint4 v7 = now.Load4(at + 7168u);
-        h = (h ^ v0) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-        h = (h ^ v1) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-        h = (h ^ v2) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-        h = (h ^ v3) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-        h = (h ^ v4) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-        h = (h ^ v5) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-        h = (h ^ v6) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-        h = (h ^ v7) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
-    [loop]
-    for (; at < hi; at += 1024u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    for (uint s = 0u; s < 16u; s += 2u) {
+        uint base = lo + s * 4096u + thread * 16u;
+#if FINE
+        uint2 a = uint2(0x9E3779B9u, 0x85EBCA6Bu) + thread;
+        uint2 b = a;
+#endif
+        if (base + 7168u < hi) {
+            uint4 v0 = now.Load4(base + 0u);
+            uint4 v1 = now.Load4(base + 1024u);
+            uint4 v2 = now.Load4(base + 2048u);
+            uint4 v3 = now.Load4(base + 3072u);
+            uint4 v4 = now.Load4(base + 4096u);
+            uint4 v5 = now.Load4(base + 5120u);
+            uint4 v6 = now.Load4(base + 6144u);
+            uint4 v7 = now.Load4(base + 7168u);
+            h = mix4(h, v0);
+            h = mix4(h, v1);
+            h = mix4(h, v2);
+            h = mix4(h, v3);
+            h = mix4(h, v4);
+            h = mix4(h, v5);
+            h = mix4(h, v6);
+            h = mix4(h, v7);
+#if FINE
+            // Rows 0-3 of the eight are the first part, 4-7 the second:
+            // 1,024 bytes a row, 4,096 a part.
+            a = mix2(a, v0);
+            a = mix2(a, v1);
+            a = mix2(a, v2);
+            a = mix2(a, v3);
+            b = mix2(b, v4);
+            b = mix2(b, v5);
+            b = mix2(b, v6);
+            b = mix2(b, v7);
+#endif
+        } else {
+            // The piece is cut short (the last of a copy, or a copy shorter
+            // than its buffer): the rows that are there, in that order.
+            [loop]
+            for (uint i = 0u; i < 8u; ++i) {
+                uint one = base + i * 1024u;
+                if (one >= hi) break;
+                uint4 v = now.Load4(one);
+                h = mix4(h, v);
+#if FINE
+                if (i < 4u) a = mix2(a, v); else b = mix2(b, v);
+#endif
+            }
+        }
+#if FINE
+        fines[s * 64u + thread] = a;
+        fines[(s + 1u) * 64u + thread] = b;
+#endif
     }
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
+#if FINE
+    // One thread for each of the sixteen parts: its 64 threads' hashes as
+    // one, against the hash stored for that part.
+    if (thread < 16u) {
+        uint2 f = fines[thread * 64u];
+        [loop]
+        for (uint t = 1u; t < 64u; ++t) f = join2(f, fines[thread * 64u + t]);
+        uint where = kept + 16u + thread * 8u;
+        if (compare != 0u) {
+            uint2 was = hashes.Load2(where);
+            if (f.x != was.x || f.y != was.y) InterlockedOr(found, 1u << thread);
+            if (compare == 2u) hashes.Store2(where, f);
+        } else {
+            hashes.Store2(where, f);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+#endif
     if (thread != 0u) return;
     h = parts[0];
     [loop]
     for (uint i = 1u; i < 64u; ++i) {
-        h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+        h = mix4(h, parts[i]);
     }
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
-        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
+        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(kept)) ? 1u : 0u));
+#if FINE
+        marks.Store(out_at + id.x * 4u, found);
+#endif
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) hashes.Store4(kept, h);
     } else {
-        hashes.Store4(piece * 16u, h);
+        hashes.Store4(kept, h);
     }
 }
 "#;
@@ -2618,16 +2729,38 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
-fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
-    let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
+fn flagged_pieces(flags: &[(usize, u32, bool, u32)]) -> Vec<(usize, u32, u32)> {
+    let mut pieces: Vec<(usize, u32, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1, f.3)).collect();
     pieces.sort_unstable();
-    pieces.dedup();
+    // The same piece under two ranges: the parts flagged under either of
+    // them, and nothing known of the parts if either knew nothing (a mask
+    // of 0, which asks for the piece whole).
+    pieces.dedup_by(|b, a| {
+        if (a.0, a.1) != (b.0, b.1) {
+            return false;
+        }
+        a.2 = if a.2 == 0 || b.2 == 0 { 0 } else { a.2 | b.2 };
+        true
+    });
     pieces
+}
+
+/// The 4 KiB parts the compare flagged of piece `at` of its results
+/// (`marks`), or 0 where nothing is known of them: the compare did not run
+/// for this piece, it was not built to mark the parts
+/// (`crate::shadow::fetch_parts`), or it flagged the piece by its own hash
+/// and no part of it, which a hash of a part can only miss at 1 in 2^64 —
+/// the piece then comes down whole, as it did before.
+fn flagged_parts(marks: Option<&[u32]>, compared: bool, at: u32) -> u32 {
+    if !compared {
+        return 0;
+    }
+    marks.and_then(|marks| marks.get(at as usize)).copied().unwrap_or(0)
 }
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{flagged_parts, flagged_pieces, landable};
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -2656,13 +2789,35 @@ mod relay_tests {
         let (a, b) = (0x1000usize, 0x2000usize);
         // Copy a: piece 3 under two ranges, flagged under the first only;
         // piece 4 not flagged; copy b: piece 3 not flagged, piece 9 flagged.
-        let flags = [(a, 3, true), (a, 4, false), (a, 3, false), (b, 3, false), (b, 9, true)];
+        let flags = [(a, 3, true, 1), (a, 4, false, 0), (a, 3, false, 0), (b, 3, false, 0), (b, 9, true, 2)];
         let fetch = flagged_pieces(&flags);
-        assert!(fetch.contains(&(a, 3)));
-        assert!(!fetch.contains(&(a, 4)));
-        assert!(!fetch.contains(&(b, 3)));
-        assert!(fetch.contains(&(b, 9)));
+        assert!(fetch.iter().any(|f| (f.0, f.1) == (a, 3)));
+        assert!(!fetch.iter().any(|f| (f.0, f.1) == (a, 4)));
+        assert!(!fetch.iter().any(|f| (f.0, f.1) == (b, 3)));
+        assert!(fetch.iter().any(|f| (f.0, f.1) == (b, 9)));
         assert_eq!(fetch.len(), 2);
+    }
+
+    /// One piece flagged under two ranges is fetched for the parts flagged
+    /// under either; a range that knew nothing of its parts takes it whole.
+    #[test]
+    fn the_parts_of_a_piece_flagged_twice_are_joined() {
+        let a = 0x1000usize;
+        let flags = [(a, 3, true, 0b0001), (a, 3, true, 0b0100), (a, 7, true, 0b0010), (a, 7, true, 0)];
+        let fetch = flagged_pieces(&flags);
+        assert_eq!(fetch, vec![(a, 3, 0b0101), (a, 7, 0)]);
+    }
+
+    /// What a piece's parts are taken to be: nothing without a compare,
+    /// nothing without marks, and the mask where there is one.
+    #[test]
+    fn parts_are_known_only_from_a_compare_that_marked_them() {
+        let marks = [0b0010u32, 0b1000];
+        assert_eq!(flagged_parts(Some(&marks), true, 1), 0b1000);
+        assert_eq!(flagged_parts(Some(&marks), false, 1), 0);
+        assert_eq!(flagged_parts(None, true, 1), 0);
+        // Past the results: nothing known.
+        assert_eq!(flagged_parts(Some(&marks), true, 9), 0);
     }
 }
 
@@ -4257,6 +4412,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                state_lost: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -4329,14 +4485,25 @@ impl Host {
         use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
         use windows::Win32::Graphics::Direct3D::ID3DBlob;
         let mut code: Option<ID3DBlob> = None;
-        // SAFETY: the source and names live through the call; the out
-        // pointer is ours.
+        // The compare that hashes each 4 KiB part of a piece is a build of
+        // its own (`crate::shadow::fetch_parts`): its 8 KiB of the group's
+        // own memory would cost the plain one occupancy for nothing.
+        let fine = [
+            windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO {
+                Name: windows::core::s!("FINE"),
+                Definition: windows::core::s!("1"),
+            },
+            windows::Win32::Graphics::Direct3D::D3D_SHADER_MACRO::default(),
+        ];
+        let defines = crate::shadow::fetch_parts().then_some(fine.as_ptr());
+        // SAFETY: the source, names and defines live through the call; the
+        // out pointer is ours.
         unsafe {
             D3DCompile(
                 CARD_COMPARE.as_ptr().cast(),
                 CARD_COMPARE.len(),
                 windows::core::s!("card compare"),
-                None,
+                defines,
                 None,
                 windows::core::s!("main"),
                 windows::core::s!("cs_5_1"),
@@ -4353,6 +4520,8 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
+        let (marks, marked) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        name(&marks, || "card compare results, the 4 KiB parts that differ".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
         unsafe {
@@ -4375,6 +4544,7 @@ impl Host {
                 root,
                 pso,
                 differs: (differs, data as usize, RESULTS),
+                marks: (marks, marked as usize, RESULTS),
                 fetched: None,
                 taken: 0,
                 out: 0,
@@ -4495,6 +4665,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(4, work.marks.0.GetGPUVirtualAddress());
                     for (shadow, ranges) in &dirty {
                         let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
                             continue;
@@ -4625,6 +4796,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    list.SetComputeRootUnorderedAccessView(4, work.marks.0.GetGPUVirtualAddress());
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
@@ -4744,9 +4916,13 @@ impl Host {
     fn relay_card_back(&self, plans: &[(&CardPlan, u64)], fetch: &mut Option<RelayFetch>, meanwhile: &mut dyn FnMut()) {
         use crate::land;
         let gathering = std::time::Instant::now();
-        let differs = {
+        let (differs, marks) = {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
-            work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
+            let of = |b: &(ID3D12Resource, usize, u64)| (b.1, (b.2 / 4) as usize);
+            match work.as_ref() {
+                Some(work) => (Some(of(&work.differs)), crate::shadow::fetch_parts().then(|| of(&work.marks))),
+                None => (None, None),
+            }
         };
         let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
@@ -4757,13 +4933,17 @@ impl Host {
         // have run, and their dwords are given to no other plan before these
         // are done with (`card_done`).
         let differs = differs.map(|(differs, dwords)| unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) });
+        // SAFETY: as `differs`; the same compares wrote it, dword for dword.
+        let marks = marks.map(|(marks, dwords)| unsafe { std::slice::from_raw_parts(marks as *const u32, dwords) });
+        // What the parts left out of the fetch, for the frame line.
+        let (mut whole, mut narrowed) = (0u64, 0u64);
         if let Some(differs) = differs {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
+                let flags: Vec<(usize, u32, bool, u32)> = plan
                     .ranges
                     .iter()
                     .filter(|r| !r.picked)
@@ -4771,7 +4951,14 @@ impl Host {
                         (0..r.span.pieces).map(move |p| {
                             let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
                             let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
+                            // A piece the compare did not flag but `torn`
+                            // wants comes down whole: its mask is of the
+                            // flight that flagged it, not of this one.
+                            let parts = match flagged {
+                                true => flagged_parts(marks, r.compared, r.at + p),
+                                false => 0,
+                            };
+                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted, parts)
                         })
                     })
                     .collect();
@@ -4782,11 +4969,30 @@ impl Host {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
                     for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
+                        let Ok(found) = fetched.binary_search_by(|f| (f.0, f.1).cmp(&(copy, r.span.first + p))) else {
+                            continue;
+                        };
+                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        if lo >= hi {
                             continue;
                         }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && !seen.contains(&(copy, lo, hi)) {
+                        // Only the 4 KiB parts the compare flagged, where it
+                        // marked them (`crate::shadow::fetch_parts`). The
+                        // parts begin where the compare hashes from, which
+                        // is the piece's own offset rounded down to 16.
+                        let runs = match marks.is_some() {
+                            true => {
+                                let base = r.shadow.card_hashed(r.span.first + p).0;
+                                crate::shadow::card_part_runs(base, fetched[found].2, lo, hi)
+                            }
+                            false => vec![(lo, hi)],
+                        };
+                        whole += (hi - lo) as u64;
+                        narrowed += runs.iter().map(|&(from, to)| (to - from) as u64).sum::<u64>();
+                        for (lo, hi) in runs {
+                            if seen.contains(&(copy, lo, hi)) {
+                                continue;
+                            }
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {
                                 land::count(land::stat::HAD, 1);
@@ -4806,6 +5012,14 @@ impl Host {
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
+        }
+        {
+            // Counted before the early exit below: a landing whose masks
+            // narrowed every piece away has nothing to fetch, and that is
+            // the best the parts can do, not a landing worth no credit.
+            use crate::shadow::CARD_STATS;
+            CARD_STATS[7].fetch_add(whole, Ordering::Relaxed);
+            CARD_STATS[8].fetch_add(narrowed, Ordering::Relaxed);
         }
         if land::on() {
             // In the order they are landed, each byte of a copy once.
@@ -5156,10 +5370,14 @@ impl Host {
         // SAFETY: the mapping of the results, which the compare (it has
         // run) wrote.
         let differs = unsafe { std::slice::from_raw_parts(work.differs.1 as *const u32, (work.differs.2 / 4) as usize) };
+        // SAFETY: as `differs`; the same compare wrote it, dword for dword.
+        let marks = crate::shadow::fetch_parts()
+            .then(|| unsafe { std::slice::from_raw_parts(work.marks.1 as *const u32, (work.marks.2 / 4) as usize) });
         // The pieces to fetch: the range, the offsets in its copy, and
         // where the bytes come down.
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
+        let (mut whole, mut narrowed) = (0u64, 0u64);
         plan.picked_found(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
             for p in 0..r.span.pieces {
@@ -5167,9 +5385,26 @@ impl Host {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo < hi && seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
-                    pieces.push((i, lo, hi, total));
-                    total += (hi - lo) as u64;
+                if lo >= hi {
+                    continue;
+                }
+                // Only the 4 KiB parts the compare flagged, where it marked
+                // them (`crate::shadow::fetch_parts`).
+                let runs = match marks {
+                    Some(marks) => {
+                        let base = r.shadow.card_hashed(r.span.first + p).0;
+                        let parts = flagged_parts(Some(marks), r.compared, r.at + p);
+                        crate::shadow::card_part_runs(base, parts, lo, hi)
+                    }
+                    None => vec![(lo, hi)],
+                };
+                whole += (hi - lo) as u64;
+                narrowed += runs.iter().map(|&(from, to)| (to - from) as u64).sum::<u64>();
+                for (lo, hi) in runs {
+                    if seen.insert((std::sync::Arc::as_ptr(&r.shadow) as usize, lo, hi)) {
+                        pieces.push((i, lo, hi, total));
+                        total += (hi - lo) as u64;
+                    }
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
@@ -5216,6 +5451,8 @@ impl Host {
                 CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
                 CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
                 CARD_STATS[6].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+                CARD_STATS[7].fetch_add(whole, Ordering::Relaxed);
+                CARD_STATS[8].fetch_add(narrowed, Ordering::Relaxed);
             }
             if wide_merge() && pieces.len() >= 8 {
                 // The pieces are apart from one another (each its own bytes
@@ -6589,12 +6826,15 @@ impl HostList {
     /// (also when the draw only tests), and every unordered access view a
     /// shader names as written; views a shader picks from the heap by a
     /// computed index are not seen here at all.
+    #[track_caller]
     pub(crate) fn twin_use(
         &self,
         resource: crate::object::This,
         colour: bool,
         write: bool,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let caller = std::panic::Location::caller();
         const UNORDERED_ACCESS: u32 = 0x8;
         // Asked for every texture a draw reads: most have no twin.
         let Some(twin) = crate::resource::twin(resource) else {
@@ -6640,8 +6880,24 @@ impl HostList {
         // still recording the title's commands cannot take. This use sees
         // the plane as it was; the pass runs when the list closes
         // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
+        // The depth plane's twin is drawn into the plane here, ahead of this
+        // use, and the title's state set again before its next draw or
+        // dispatch (`plane_before_use`).
+        let early = copy && !colour && twin.plane.is_some() && plane_early();
+        if early {
+            u.late = false;
+        } else if copy && !colour && twin.plane.is_some() {
             u.late = true;
+            // Diagnostics: who uses a depth plane before its twin's pass, the first few times.
+            #[cfg(feature = "diagnostics")]
+            if crate::resource::PLANES[2].load(Ordering::Relaxed) < 12 {
+                tracing::info!(
+                    resource = format_args!("{:#x}", resource as usize),
+                    write,
+                    at = %caller,
+                    "a depth plane is used in the list that wrote its twin, before the pass"
+                );
+            }
             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
         }
         drop(twins);
@@ -6650,11 +6906,70 @@ impl HostList {
         } else if colour {
             self.settle(&twin.colour, UNORDERED_ACCESS);
         }
+        if early {
+            self.pass_plane(&depth, &twin);
+            PLANES_EARLY.fetch_add(1, Ordering::Relaxed);
+            self.state_lost.store(true, Ordering::Relaxed);
+        }
         // The depth plane's twin is written through unordered access too.
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
         }
         true
+    }
+
+    /// Before a draw or mesh dispatch that has title depth texture `resource`
+    /// as its depth target, before anything of it is bound: if shaders of
+    /// this list wrote the twins of its planes since the texture was last
+    /// given them, the stencil plane is copied from its twin and the depth
+    /// plane drawn from its twin now, not when the list closes. True if so:
+    /// the pass set state of ours on the list, and the caller sets the
+    /// title's again ([`crate::draw::State::replay`]).
+    ///
+    /// The title's tiled lighting (compute f0c91b4d2578f5bf) writes each
+    /// pixel's material class into the depth plane's twin, then draws each
+    /// class with the depth test "equal" in the same list. With the pass
+    /// at the list's close those draws tested last frame's classes: light
+    /// fell on the sky (a wedge from the car's lamps to the horizon,
+    /// target 0x23c5d9dbda0 of capture 28881) and on the edges where things
+    /// moved (bright outlines round trees and wires against the sky), and
+    /// the wedge filled most of the screen many times over: the card busy
+    /// 120 ms a frame instead of 50 (run 20261126-045105, 10,501 uses
+    /// before the pass counted). `VICTORY_PLANE_EARLY=0`: at the close, as
+    /// before.
+    pub(crate) fn plane_before_use(&self, resource: crate::object::This) -> bool {
+        if !plane_early() {
+            return false;
+        }
+        let Some(twin) = crate::resource::twin(resource) else {
+            return false;
+        };
+        if twin.plane.is_none() {
+            return false;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(u) = twins.get_mut(&(std::sync::Arc::as_ptr(&twin) as usize)) else {
+            return false;
+        };
+        if u.behind[0] != Some(true) {
+            return false;
+        }
+        u.behind[0] = Some(false);
+        u.late = false;
+        let (depth, twin) = (u.depth.clone(), u.twin.clone());
+        drop(twins);
+        self.changed_something();
+        self.twin_copy(&depth, &twin, false);
+        self.pass_plane(&depth, &twin);
+        PLANES_EARLY.fetch_add(1, Ordering::Relaxed);
+        self.state_lost.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Whether a pass of ours set state on the list since the title's was
+    /// last set ([`HostList::plane_before_use`]); clears it.
+    pub(crate) fn take_state_lost(&self) -> bool {
+        self.state_lost.swap(false, Ordering::Relaxed)
     }
 
     /// Records the pass that draws the twin of the depth plane of `depth`
@@ -8889,6 +9204,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        crate::shadow::windows_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
@@ -8945,6 +9261,7 @@ impl Meter {
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         // Depth planes drawn from their twins.
         let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let planes_early = PLANES_EARLY.swap(0, Ordering::Relaxed) as f64 / frames;
         // Copies in the card's memory (`crate::shadow::cards`).
         let card = crate::shadow::card_stats();
         #[cfg(feature = "diagnostics")]
@@ -9027,17 +9344,23 @@ impl Meter {
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
-                    card[7],
-                    card[8] >> 20,
-                    card[9] >> 20,
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms); of the pieces fetched {:.1} MB lay \
+                     in them whole and {:.1} MB was wanted of them (VICTORY_FETCH_PARTS={}: only the 4 KiB parts \
+                     the compare flagged, which is what is merged; with VICTORY_FETCH_CHECK the pieces still come \
+                     down whole, as that check hashes each one as the compare does)",
+                    card[9],
+                    card[10] >> 20,
+                    card[11] >> 20,
                     per_frame(0) / 1e6,
                     per_frame(1),
                     per_frame(2),
                     per_frame(3),
                     per_frame(4) / 1e6,
                     per_frame(5),
-                    per_frame(6) / 1e3
+                    per_frame(6) / 1e3,
+                    per_frame(7) / 1e6,
+                    per_frame(8) / 1e6,
+                    u8::from(crate::shadow::fetch_parts())
                 );
             }
             tracing::info!(
@@ -9057,7 +9380,7 @@ impl Meter {
                 du2 = crate::resource::DEPTH_UNORDERED[2].load(Ordering::Relaxed),
                 du3 = crate::resource::DEPTH_UNORDERED[3].load(Ordering::Relaxed),
                 refused = format!(
-                    "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame, {} times not given back to a twin, {} times used before the pass",
+                    "{} ({} copies made of views off their buffer's elements); depth twins: {} alive, {} depth textures left without one; twin copies per frame: {twin_to_depth:.1} into depth textures, {twin_to_colour:.1} into twins; depth planes: {planes:.1} drawn from their twins per frame ({planes_early:.1} of them ahead of a draw that uses them, VICTORY_PLANE_EARLY), {} times not given back to a twin, {} times used before the pass",
                     crate::descriptor::host::REFUSED_VIEWS.load(Ordering::Relaxed),
                     crate::shadow::OWN_MADE.load(Ordering::Relaxed),
                     crate::resource::TWINS[0].load(Ordering::Relaxed),

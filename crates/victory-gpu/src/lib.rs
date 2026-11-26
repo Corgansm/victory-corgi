@@ -17,6 +17,9 @@
 
 #[cfg(windows)]
 mod ambient;
+// The title's ray-tracing structures as flat lists, for host (DXR) structures: not used yet.
+#[allow(dead_code)]
+mod bvh_flat;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 // The in-game debugger, `VICTORY_DEBUGGER=<folder>` (from victory-corgi).
@@ -74,6 +77,9 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
+// Settings changed while the title runs, and their menus (VICTORY_LIVE_FILE).
+#[cfg(windows)]
+mod live;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]

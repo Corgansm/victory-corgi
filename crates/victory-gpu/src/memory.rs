@@ -179,6 +179,8 @@ struct Memory {
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
     stats: Stats,
+    /// `VICTORY_DXR=1`: the title's ray-tracing structures read back.
+    dxr: dxr::Dxr,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
     #[cfg(feature = "diagnostics")]
@@ -254,6 +256,7 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
             stats: Stats::default(),
+            dxr: Default::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
             #[cfg(feature = "diagnostics")]
@@ -917,6 +920,9 @@ pub(crate) fn ready(
         m.take_faults();
         m.look_again();
         m.report();
+        if dxr::on() {
+            m.dxr_frame();
+        }
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
     }
@@ -1064,12 +1070,251 @@ pub(crate) fn ready(
     if use_ == Use::Reads {
         m.dump.walked(addresses);
     }
+    // After the pages are brought up, so the reads see this frame's.
+    if use_ == Use::Reads && dxr::on() {
+        m.dxr_tops(list, addresses);
+    }
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
     })
+}
+
+/// Native ray tracing, its first stage (`VICTORY_DXR=1`; off by default): the
+/// top levels the trace programs are given and the bottom levels their
+/// instances name, read back from the card a few frames later, and a line
+/// every ten seconds of what a host (DXR) structure of them would hold. No
+/// structure is built yet (`DXR-PLAN.md`, step 2).
+mod dxr {
+    use super::*;
+
+    pub(super) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // (The live menus switch it, `crate::live`.)
+        crate::live::get(crate::live::DXR)
+            .map_or_else(|| *ON.get_or_init(|| std::env::var_os("VICTORY_DXR").is_some_and(|v| v == "1")), |v| v >= 0.5)
+    }
+
+    /// Bytes read of a top level: its header and instance list (1543
+    /// instances of 128 bytes from 0x8580 in the biggest seen).
+    pub(super) const TOP_BYTES: u64 = 512 << 10;
+    /// Bottom levels whose headers are read at a time.
+    pub(super) const BOTTOMS: usize = 4096;
+    /// Frames before a read is looked at.
+    pub(super) const LATER: u64 = 3;
+
+    pub(super) enum What {
+        Top(u64),
+        Bottoms(Vec<u64>),
+    }
+
+    pub(super) struct Pending {
+        pub(super) due: u64,
+        pub(super) what: What,
+        pub(super) buffer: ID3D12Resource,
+        pub(super) data: usize,
+        /// Bytes that came from a copy, by offset in the buffer.
+        pub(super) got: Vec<(u64, u64)>,
+    }
+
+    /// What is known of a bottom level.
+    #[derive(Clone, Copy, Default)]
+    pub(super) struct Bottom {
+        pub(super) header: [u32; 16],
+        pub(super) frame: u64,
+    }
+
+    #[derive(Default)]
+    pub(super) struct Dxr {
+        pub(super) pending: Vec<Pending>,
+        /// Top level address: the frame it was last read in, its instances'
+        /// bottom levels and how many instances.
+        pub(super) tops: HashMap<u64, (u64, Vec<u64>, u32)>,
+        pub(super) bottoms: HashMap<u64, Bottom>,
+        pub(super) reported: Option<std::time::Instant>,
+        pub(super) stats: [u64; 4],
+    }
+
+    impl Pending {
+        /// Dword `n` of the read, if it came.
+        pub(super) fn word(&self, n: u64) -> Option<u32> {
+            let at = 4 * n;
+            if !self.got.iter().any(|&(from, len)| from <= at && at + 4 <= from + len) {
+                return None;
+            }
+            // SAFETY: inside the read's mapping, which came frames ago.
+            Some(unsafe { (self.data as *const u32).add(n as usize).read() })
+        }
+    }
+
+    /// A version-6 header of a bottom level (bit 31) that is not packed.
+    pub(super) fn usable_bottom(h: &[u32; 16]) -> bool {
+        h[0] & 0xffff == 6 && h[0] >> 31 == 1 && h[0] >> 16 & 0x100 == 0
+    }
+}
+
+impl Memory {
+    /// Copies `len` bytes of title memory from `at` into `buffer` from
+    /// `into` on, page by page, where an arena holds them; the pieces that
+    /// came.
+    fn dxr_read(&self, list: &HostList, at: u64, len: u64, buffer: &ID3D12Resource, into: u64) -> Vec<(u64, u64)> {
+        let mut got = Vec::new();
+        let mut done = 0;
+        while done < len {
+            let address = at + done;
+            let page = address / PAGE;
+            let n = (PAGE - address % PAGE).min(len - done);
+            if let Some(place) = self.copy_of(page)
+                && self.arenas.iter().any(|a| a.0 == place)
+            {
+                // SAFETY: an entry of the directory.
+                let start = u64::from(unsafe { self.entry(page).add(1).read() });
+                let from = &self.copies[place].buffer;
+                let turn = |before, after| D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            // SAFETY: the same pointer, not counted; used
+                            // while the arena lives.
+                            pResource: unsafe { std::mem::transmute_copy(from) },
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: before,
+                            StateAfter: after,
+                        }),
+                    },
+                };
+                // SAFETY: an open list; live buffers; inside both (an arena
+                // page is a whole 64 KiB of the arena).
+                unsafe {
+                    list.list.ResourceBarrier(&[turn(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    list.list.CopyBufferRegion(buffer, into + done, from, start + address % PAGE, n);
+                    list.list.ResourceBarrier(&[turn(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                got.push((into + done, n));
+            }
+            done += n;
+        }
+        got
+    }
+
+    /// The top levels a trace dispatch is given: each read once a frame.
+    fn dxr_tops(&mut self, list: &HostList, addresses: &[u64]) {
+        let Some(host) = host() else { return };
+        for &top in addresses {
+            if self.dxr.tops.get(&top).is_some_and(|t| t.0 + 30 > self.frame) || self.dxr.pending.len() > 64 {
+                continue;
+            }
+            if self.dxr.pending.iter().any(|p| matches!(p.what, dxr::What::Top(a) if a == top)) {
+                continue;
+            }
+            let Some((buffer, data)) = host.shared_buffer(dxr::TOP_BYTES) else { return };
+            let got = self.dxr_read(list, top, dxr::TOP_BYTES, &buffer, 0);
+            list.keep(&buffer);
+            self.dxr.stats[0] += 1;
+            self.dxr.pending.push(dxr::Pending { due: self.frame + dxr::LATER, what: dxr::What::Top(top), buffer, data: data as usize, got });
+            let entry = self.dxr.tops.entry(top).or_insert((0, Vec::new(), 0));
+            entry.0 = self.frame;
+            // The bottom levels its instances named last time, their headers.
+            let wanted: Vec<u64> = entry.1.iter().copied().take(dxr::BOTTOMS).collect();
+            if !wanted.is_empty() {
+                let Some((buffer, data)) = host.shared_buffer(64 * wanted.len() as u64) else { return };
+                let mut got = Vec::new();
+                for (k, &b) in wanted.iter().enumerate() {
+                    got.extend(self.dxr_read(list, b, 64, &buffer, 64 * k as u64));
+                }
+                list.keep(&buffer);
+                self.dxr.pending.push(dxr::Pending { due: self.frame + dxr::LATER, what: dxr::What::Bottoms(wanted), buffer, data: data as usize, got });
+            }
+        }
+    }
+
+    /// Once a frame: reads that came are looked at; a line every ten
+    /// seconds.
+    fn dxr_frame(&mut self) {
+        let frame = self.frame;
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dxr.pending).into_iter().partition(|p| p.due <= frame);
+        self.dxr.pending = waiting;
+        for p in ready {
+            match &p.what {
+                dxr::What::Top(top) => {
+                    let header: Option<Vec<u32>> = (0..16).map(|n| p.word(n)).collect();
+                    let top_level = header.as_ref().is_some_and(|h| h[0] & 0xffff == 6 && h[0] >> 31 == 0);
+                    let (Some(h), true) = (header.clone(), top_level) else {
+                        // Not a top level (another view the program is
+                        // given): not read again.
+                        if let (Some(t), Some(_)) = (self.dxr.tops.get_mut(top), &header) {
+                            t.0 = u64::MAX / 2;
+                        }
+                        continue;
+                    };
+                    let (first, count) = (u64::from(h[13]), h[3]);
+                    let mut bottoms: Vec<u64> = (0..u64::from(count))
+                        .filter(|k| first + 128 * k + 64 <= dxr::TOP_BYTES)
+                        .filter_map(|k| p.word((first + 128 * k) / 4 + 15).map(|w| u64::from(w) << 8))
+                        .filter(|&b| b != 0)
+                        .collect();
+                    bottoms.sort_unstable();
+                    bottoms.dedup();
+                    self.dxr.stats[1] += 1;
+                    if let Some(t) = self.dxr.tops.get_mut(top) {
+                        t.1 = bottoms;
+                        t.2 = count;
+                    }
+                }
+                dxr::What::Bottoms(list) => {
+                    for (k, &b) in list.iter().enumerate() {
+                        let header: Option<Vec<u32>> = (0..16).map(|n| p.word(16 * k as u64 + n)).collect();
+                        if let Some(h) = header {
+                            let mut words = [0u32; 16];
+                            words.copy_from_slice(&h);
+                            self.dxr.bottoms.insert(b, dxr::Bottom { header: words, frame });
+                            self.dxr.stats[2] += 1;
+                        } else {
+                            self.dxr.stats[3] += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let now = std::time::Instant::now();
+        if self.dxr.reported.is_some_and(|r| now.duration_since(r).as_secs() < 10) {
+            return;
+        }
+        self.dxr.reported = Some(now);
+        let mut line = String::new();
+        for (top, (seen, bottoms, count)) in &self.dxr.tops {
+            if *seen + 120 < frame || *count == 0 {
+                continue;
+            }
+            let (mut usable, mut statics, mut elements, mut unknown) = (0, 0, 0u64, 0);
+            for b in bottoms {
+                match self.dxr.bottoms.get(b) {
+                    Some(x) if dxr::usable_bottom(&x.header) => {
+                        usable += 1;
+                        elements += u64::from(x.header[3]);
+                        statics += usize::from(x.header[0] >> 16 & 2 != 0);
+                    }
+                    Some(_) => {}
+                    None => unknown += 1,
+                }
+            }
+            line += &format!(
+                "; top {top:#x}: {count} instances, {} bottom levels ({usable} usable, {statics} of them rehydrated, {unknown} not read yet), {elements} elements (at most {} triangles)",
+                bottoms.len(),
+                elements * 4
+            );
+        }
+        tracing::info!(
+            "native ray tracing (VICTORY_DXR=1, reading only): {} top levels read, {} looked at, {} bottom-level headers read, {} not there{line}",
+            self.dxr.stats[0],
+            self.dxr.stats[1],
+            self.dxr.stats[2],
+            self.dxr.stats[3]
+        );
+    }
 }
 
 /// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of

@@ -13,6 +13,42 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 /// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
 const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
 
+/// The 1.0.2.1 executable's PE header: its link time stamp and
+/// `SizeOfImage`. A copy patched in its code only (the low-spec build of it,
+/// `scarlett_lowspec.py`) keeps both while its hash differs.
+const BUILD_1_0_2_1_HEADER: (u32, u32) = (0x6af7_83d4, 0x0b06_d000);
+
+/// Whether the image at `base` (whose file's BLAKE3 is `hash`) is the
+/// 1.0.2.1 executable or a copy of it patched in its code. The hooks still
+/// check every byte they replace, so a site the copy changed is skipped.
+///
+/// # Safety
+/// `base` is a mapped image with its headers.
+unsafe fn is_1_0_2_1(base: usize, hash: &blake3::Hash) -> bool {
+    if hash.to_hex().starts_with(BUILD_1_0_2_1) {
+        return true;
+    }
+    let at = base as *const u8;
+    // SAFETY: the DOS and PE headers of the mapped image (the PE header
+    // lies in its first page).
+    let (signature, stamp, size) = unsafe {
+        let pe = at.add(0x3c).cast::<u32>().read_unaligned() as usize;
+        if pe > 0x1000 - 0x60 {
+            return false;
+        }
+        (
+            at.add(pe).cast::<u32>().read_unaligned(),
+            at.add(pe + 8).cast::<u32>().read_unaligned(),
+            at.add(pe + 24 + 56).cast::<u32>().read_unaligned(),
+        )
+    };
+    let copy = signature == 0x4550 && (stamp, size) == BUILD_1_0_2_1_HEADER;
+    if copy {
+        tracing::info!("a patched copy of the 1.0.2.1 executable: its hooks are checked byte by byte");
+    }
+    copy
+}
+
 /// Environment variable that turns the watchdog hook on.
 pub(crate) const NO_WATCHDOG_ENV: &str = "VICTORY_NO_WATCHDOG";
 
@@ -54,7 +90,8 @@ const WATCHDOG: &[Patch<'static>] = &[
 /// `base` is the mapped image whose original BLAKE3 is `hash`, and no title
 /// code is running yet.
 pub(crate) unsafe fn disarm_watchdog(base: usize, hash: &blake3::Hash) -> usize {
-    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
+    // SAFETY: forwarded from this function's contract.
+    if !unsafe { is_1_0_2_1(base, hash) } {
         return 0;
     }
     WATCHDOG
@@ -169,7 +206,8 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     }
     // Every image the loader maps comes here (the title's DLLs too); only
     // the 1.0.2.1 executable has the patched places.
-    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
+    // SAFETY: forwarded from this function's contract.
+    if !unsafe { is_1_0_2_1(base, hash) } {
         tracing::debug!("resolution levers: not the 1.0.2.1 executable; nothing patched");
         return 0;
     }
@@ -197,6 +235,128 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         }
     }
     applied
+}
+
+/// The title's own upscaler (type 6), a global object of the 1.0.2.1
+/// executable, and its vtable: the size function
+/// (RVA `0x1de4030`) asks it for the render size, which it keeps in
+/// [`RENDER`], from the output size it keeps in [`OUTPUT`]; the render
+/// targets are made at [`LARGEST`].
+const OWN_UPSCALER_OBJECT: usize = 0x7b9_9040;
+const OWN_UPSCALER_VTABLE: usize = 0x630_0bf0;
+const OUTPUT: [usize; 2] = [0x8fd_c560, 0x91a_c9fc];
+const RENDER: [usize; 2] = [0x99f_ecf8, 0x99f_ecfc];
+const LARGEST: [usize; 2] = [0x8fd_c558, 0x8fd_c55c];
+
+/// The live menus' render scale (`VICTORY_LIVE_FILE`, victory-gpu's `live`):
+/// a thread of ours puts the size it asks for into the title's render size,
+/// no larger than its render targets, again whenever the title works it out
+/// anew. Only with the title's own upscaler (`VICTORY_OWN_UPSCALER=1`): FSR
+/// takes one size only. It writes `<file>.render` with the sizes (render,
+/// output, largest) for the menus. Returns whether it started.
+///
+/// # Safety
+/// As `disarm_watchdog`; the image stays mapped while the process runs.
+pub(crate) unsafe fn live_render_scale(base: usize, hash: &blake3::Hash) -> bool {
+    let Some(file) = std::env::var_os("VICTORY_LIVE_FILE").filter(|v| !v.is_empty()) else {
+        return false;
+    };
+    // SAFETY: forwarded from this function's contract.
+    if !unsafe { is_1_0_2_1(base, hash) } {
+        return false;
+    }
+    let file = std::path::PathBuf::from(file);
+    std::thread::Builder::new().name("victory-live-render-scale".into()).spawn(move || render_scale_loop(base, &file)).is_ok()
+}
+
+/// A `u32` of the title's memory at `rva`.
+///
+/// # Safety
+/// `base` is the 1.0.2.1 executable, mapped; `rva` one of its globals.
+unsafe fn word(base: usize, rva: usize) -> u32 {
+    // SAFETY: forwarded; an aligned global of the image.
+    unsafe { std::ptr::read_volatile((base + rva) as *const u32) }
+}
+
+fn render_scale_loop(base: usize, file: &std::path::Path) {
+    let started = std::time::SystemTime::now();
+    let mut render_file = file.to_path_buf().into_os_string();
+    render_file.push(".render");
+    let render_file = std::path::PathBuf::from(render_file);
+    // The file's value last read, and the scale a change asked for.
+    let (mut seen, mut wanted): (Option<f32>, Option<f32>) = (None, None);
+    let mut said = [0u32; 6];
+    let mut warned = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // SAFETY: globals of the mapped 1.0.2.1 executable.
+        let (output, render, largest) = unsafe {
+            (
+                [word(base, OUTPUT[0]), word(base, OUTPUT[1])],
+                [word(base, RENDER[0]), word(base, RENDER[1])],
+                [word(base, LARGEST[0]), word(base, LARGEST[1])],
+            )
+        };
+        let ready = output[0] > 0 && output[1] > 0 && largest[0] > 0 && largest[1] > 0;
+        // (Only a file written in this run: victory-gpu writes it at its start.)
+        let written_now = std::fs::metadata(file).and_then(|m| m.modified()).is_ok_and(|m| m >= started);
+        if written_now && let Some(v) = read_scale(file) {
+            let title = (render[0] as f32) / (output[0].max(1) as f32);
+            match seen {
+                None => seen = Some(v),
+                Some(s) if (s - v).abs() > 1e-4 => {
+                    seen = Some(v);
+                    // (The menus starting from the title's own scale is no change.)
+                    if !ready || (v - title).abs() > 0.006 || wanted.is_some() {
+                        wanted = Some(v.clamp(0.2, 1.0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(scale) = wanted.filter(|_| ready) {
+            // SAFETY: plain reads of the mapped image's code and data.
+            let own = unsafe {
+                std::slice::from_raw_parts((base + OWN_UPSCALER.rva) as *const u8, 3) == OWN_UPSCALER.new
+                    && std::ptr::read_volatile((base + OWN_UPSCALER_OBJECT) as *const usize) == base + OWN_UPSCALER_VTABLE
+            };
+            if own {
+                let w = ((output[0] as f32 * scale) as u32 & !1).clamp(16, largest[0]);
+                let h = ((output[1] as f32 * scale) as u32).clamp(16, largest[1]);
+                if render != [w, h] {
+                    // SAFETY: the title's render size, two aligned globals it
+                    // reads; written whole.
+                    unsafe {
+                        std::ptr::write_volatile((base + RENDER[0]) as *mut u32, w);
+                        std::ptr::write_volatile((base + RENDER[1]) as *mut u32, h);
+                        std::ptr::write_volatile((base + OWN_UPSCALER_OBJECT + 0x90) as *mut f32, scale);
+                    }
+                    tracing::info!(scale, width = w, height = h, "live render scale: the title's render size set");
+                }
+            } else if !warned {
+                warned = true;
+                tracing::warn!("live render scale: not with FSR (set VICTORY_OWN_UPSCALER=1); left as the title has it");
+            }
+        }
+        // SAFETY: as above.
+        let render = unsafe { [word(base, RENDER[0]), word(base, RENDER[1])] };
+        let sizes = [render[0], render[1], output[0], output[1], largest[0], largest[1]];
+        if ready && sizes != said {
+            said = sizes;
+            let text = sizes.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+            let _ = std::fs::write(&render_file, text);
+        }
+    }
+}
+
+/// `VICTORY_RENDER_SCALE=` in the live file.
+fn read_scale(file: &std::path::Path) -> Option<f32> {
+    let text = std::fs::read_to_string(file).ok()?;
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(name, _)| name.trim() == "VICTORY_RENDER_SCALE")
+        .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
 }
 
 /// # Safety

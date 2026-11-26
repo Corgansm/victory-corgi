@@ -247,6 +247,13 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// The most bytes of copies in the card's memory: [`card_limits`]'s, or what
+/// the live menus set (`crate::live`). Lowered, the copies there stay; no new
+/// one goes there until they are under it.
+fn card_most() -> u64 {
+    crate::live::get(crate::live::CARD_BUFFERS_MB).map_or_else(|| card_limits().1, |mb| (mb.max(0.0) as u64) << 20)
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -303,7 +310,7 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    card_most().min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -311,31 +318,148 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
-/// bytes; the waits for the card the fetches added and their microseconds.
-pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// bytes; the waits for the card the fetches added and their microseconds;
+/// then, of the pieces fetched, the bytes they hold whole and the bytes
+/// actually fetched of them ([`fetch_parts`] leaves the rest out).
+pub(crate) static CARD_STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
-pub(crate) fn card_stats() -> [u64; 10] {
-    let mut out = [0u64; 10];
+pub(crate) fn card_stats() -> [u64; 12] {
+    let mut out = [0u64; 12];
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
-    out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
+    out[9] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[10] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
-    out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
+    out[11] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
 /// for each 64 KiB piece (a copy that does not start on a piece boundary
-/// has one piece more).
+/// has one piece more), and 8 more for each of a piece's sixteen 4 KiB
+/// parts with [`fetch_parts`] — 144 a piece, which for the 2,159 MB of
+/// card copies of run bar-142856 is 4.6 MB of the card's memory in all.
 pub(crate) fn card_hash_bytes(size: u64) -> u64 {
-    (size / PIECE as u64 + 2) * 16
+    (size / PIECE as u64 + 2) * if fetch_parts() { 144 } else { 16 }
 }
 
+/// The 4 KiB parts of a 64 KiB piece that the compare on the card flags
+/// one by one ([`fetch_parts`]).
+pub(crate) const PARTS: u32 = 16;
+
+/// Whether the compare on the card hashes each 4 KiB part of a piece as
+/// well as the whole, so that a fetch brings down only the parts that
+/// differ (`VICTORY_FETCH_PARTS=1`; off by default).
+///
+/// A piece is 64 KiB and came down whole however little of it a shader
+/// wrote. Run bar-142856 fetched 55.2 MB a frame and only 29.3 MB of it
+/// lay in 4 KiB pages holding a new byte, so half the bus traffic and half
+/// the merge were of bytes that had not changed. The compare already reads
+/// every byte of a piece, so hashing each part on the way costs it no more
+/// reads (`crate::host::CARD_COMPARE`); what it costs is 8 bytes a part of
+/// hashes on the card, the group's own memory for them, and a build of the
+/// compare of its own.
+///
+/// With `VICTORY_FETCH_CHECK` the pieces still come down whole, as that
+/// check hashes a piece as the compare does (`crate::host::torn`); only
+/// the merge is then narrowed.
+pub(crate) fn fetch_parts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_PARTS").is_some_and(|v| v == "1"))
+}
+
+/// The offsets to fetch of a piece whose 4 KiB parts `mask` flags, as runs
+/// of parts that touch, each cut to `[lo, hi)` (what lies of the piece in
+/// the range declared). `base` is where the compare's parts begin: the
+/// piece's own offset rounded down to 16 ([`Shadow::card_hashed`]), which
+/// is what the compare hashes from.
+///
+/// A `mask` of 0 means nothing is known of the parts (the piece was not
+/// compared, or the compare flagged it without a mask): the whole of
+/// `[lo, hi)`. Nothing to fetch is an answer: the parts that changed can
+/// all lie outside the declared range, and the piece is flagged by its
+/// own hash, which covers the whole 64 KiB.
+pub(crate) fn card_part_runs(base: usize, mask: u32, lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    if mask == 0 || mask >= (1 << PARTS) - 1 || lo >= hi {
+        return vec![(lo, hi)];
+    }
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut part = 0;
+    while part < PARTS {
+        if mask & (1 << part) == 0 {
+            part += 1;
+            continue;
+        }
+        let mut end = part + 1;
+        while end < PARTS && mask & (1 << end) != 0 {
+            end += 1;
+        }
+        let from = (base + part as usize * 4096).max(lo);
+        let to = (base + end as usize * 4096).min(hi);
+        if from < to {
+            out.push((from, to));
+        }
+        part = end;
+    }
+    out
+}
+
+#[cfg(test)]
+mod part_tests {
+    use super::{PARTS, card_part_runs};
+
+    /// A mask of nothing, or of everything, asks for the whole range; the
+    /// runs of a mask hold every flagged part and no unflagged one.
+    #[test]
+    fn part_runs_cover_the_flagged_parts_and_no_more() {
+        let piece = 64 << 10;
+        assert_eq!(card_part_runs(0, 0, 0, piece), vec![(0, piece)]);
+        assert_eq!(card_part_runs(0, (1 << PARTS) - 1, 0, piece), vec![(0, piece)]);
+        // Parts 0, 3, 4, 5 and 15: three runs.
+        let mask = (1 << 0) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 15);
+        assert_eq!(
+            card_part_runs(0, mask, 0, piece),
+            vec![(0, 4096), (3 * 4096, 6 * 4096), (15 * 4096, piece)]
+        );
+        // Cut to a range inside the piece: the ends move, the middle stands.
+        assert_eq!(
+            card_part_runs(0, mask, 5000, 15 * 4096 + 100),
+            vec![(3 * 4096, 6 * 4096), (15 * 4096, 15 * 4096 + 100)]
+        );
+        // A base below the range (a piece that does not start on 4 KiB).
+        let base = 0x10000 - 16;
+        assert_eq!(card_part_runs(base, 1 << 1, base, base + piece), vec![(base + 4096, base + 2 * 4096)]);
+        // Flagged parts all outside the range: nothing to fetch.
+        assert!(card_part_runs(0, 1 << 15, 0, 4096).is_empty());
+        // One byte of a flagged part inside the range is enough.
+        assert_eq!(card_part_runs(0, 1 << 15, 0, 15 * 4096 + 1), vec![(15 * 4096, 15 * 4096 + 1)]);
+    }
+
+    /// Every byte of a run was flagged, and the runs are in order and do
+    /// not touch one another.
+    #[test]
+    fn part_runs_are_in_order_and_apart() {
+        for mask in 1u32..(1 << PARTS) - 1 {
+            let runs = card_part_runs(0, mask, 0, 64 << 10);
+            let mut last = 0;
+            for &(from, to) in &runs {
+                assert!(from >= last, "{mask:#x}: {from} after {last}");
+                assert!(from < to);
+                assert!(from.is_multiple_of(4096) && to.is_multiple_of(4096));
+                for part in from / 4096..to / 4096 {
+                    assert_ne!(mask & (1 << part), 0, "{mask:#x} part {part}");
+                }
+                last = to;
+            }
+            let covered: u32 = runs.iter().map(|&(from, to)| ((to - from) / 4096) as u32).sum();
+            assert_eq!(covered, mask.count_ones(), "{mask:#x}");
+        }
+    }
+}
 /// A buffer of `size` bytes in the card's memory for a title buffer's
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
@@ -374,7 +498,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
-    let (least, most) = card_limits();
+    let (least, most) = (card_limits().0, card_most());
     if size < least || size >= 1 << 30 {
         return None;
     }
@@ -484,6 +608,10 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// Windows go there while a fifth of the card's budget is free, as with
 /// [`window_room_for`], which this comes before.
 fn window_mapped_most() -> u64 {
+    // (The live menus change it, `crate::live`.)
+    if let Some(mb) = crate::live::get(crate::live::WINDOWS_BAR_MB) {
+        return (mb.max(0.0) as u64) << 20;
+    }
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
@@ -492,6 +620,154 @@ fn window_mapped_most() -> u64 {
 
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Windows turned down lately for want of the card's budget: their bytes,
+/// less those of windows placed on the card since, and when the last one was
+/// ([`crate::host::now_ms`]).
+static WINDOW_WANT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether windows turned down for the card's budget make the texture queue
+/// give up idle textures for them (`VICTORY_WINDOW_ROOM=0`: not, as before).
+///
+/// Windows go to the card only while a fifth of its budget is free, and the
+/// texture queue kept idle copies for ten minutes up to 88 hundredths of it:
+/// once the world had loaded no window found room. Run 20261126-125821
+/// (`VICTORY_WINDOWS_BAR_MB=2048`): 493 windows (2,092 MB) on the card,
+/// 434 (1,980 MB) turned down with the card full, and the card read those
+/// from the PC's memory over the bus every frame, beside SHARED 6.5 GB. A
+/// window is read by draws in every frame it lives; a texture copy idle for
+/// seconds is read by nothing.
+fn window_room_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_ROOM").is_none_or(|v| v != "0"))
+}
+
+/// A window of `size` bytes was turned down for the card's budget.
+fn window_wanted(size: u64) {
+    WINDOW_WANT[0].fetch_add(size, Ordering::Relaxed);
+    WINDOW_WANT[1].store(crate::host::now_ms(), Ordering::Relaxed);
+}
+
+/// A window of `size` bytes was placed on the card.
+fn window_placed_on_card(size: u64) {
+    let _ = WINDOW_WANT[0].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |want| Some(want.saturating_sub(size)));
+}
+
+/// The bytes of the card's memory the texture queue gives up for windows
+/// ([`window_room_on`]): what windows were turned down for lately (the last
+/// one within ten seconds), not more than the windows' caps
+/// (`VICTORY_WINDOWS_BAR_MB`, `VICTORY_CARD_WINDOWS_MB`) leave.
+pub(crate) fn window_room_wanted() -> u64 {
+    const LATELY_MS: u64 = 10_000;
+    if !window_room_on() {
+        return 0;
+    }
+    let want = WINDOW_WANT[0].load(Ordering::Relaxed);
+    if want == 0 {
+        return 0;
+    }
+    if crate::host::now_ms().saturating_sub(WINDOW_WANT[1].load(Ordering::Relaxed)) > LATELY_MS {
+        WINDOW_WANT[0].store(0, Ordering::Relaxed);
+        return 0;
+    }
+    let left = window_mapped_most().saturating_sub(WINDOW_MAPPED_BYTES.load(Ordering::Relaxed))
+        + window_card_most().saturating_sub(WINDOW_CARD_BYTES.load(Ordering::Relaxed));
+    want.min(left)
+}
+
+/// The most bytes [`WINDOW_MAPPED_BYTES`] held at one time.
+static WINDOW_MAPPED_MOST: AtomicU64 = AtomicU64::new(0);
+
+/// Since the start, of the windows outside buffers that were made
+/// ([`windows_line`]): by where each one's bytes went, (number, bytes)
+/// each - the title's own memory in place, card memory the CPU maps (the
+/// resizable BAR), the card's own memory with a CPU side beside it, the
+/// PC's memory; then what the BAR turned down, (number, bytes) each - for
+/// want of room under its cap, with the card's budget tight; then the
+/// number whose buffer the host refused.
+static WINDOW_PLACE: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+
+/// Offsets into [`WINDOW_PLACE`].
+mod place {
+    pub(super) const IN_PLACE: usize = 0;
+    pub(super) const BAR: usize = 2;
+    pub(super) const ON_CARD: usize = 4;
+    pub(super) const IN_PC: usize = 6;
+    pub(super) const NO_ROOM: usize = 8;
+    pub(super) const NO_BUDGET: usize = 10;
+    pub(super) const REFUSED: usize = 12;
+}
+
+/// A window of `size` bytes went, or did not go, to `which`
+/// ([`WINDOW_PLACE`]).
+fn window_placed(which: usize, size: u64) {
+    WINDOW_PLACE[which].fetch_add(1, Ordering::Relaxed);
+    if which != place::REFUSED {
+        WINDOW_PLACE[which + 1].fetch_add(size, Ordering::Relaxed);
+    }
+}
+
+/// Since the last frame line: filling windows with title memory
+/// ([`Shadow::copy`]) - µs and bytes of those in the BAR, then of the rest.
+/// The BAR's bytes are written over the bus and never read back, so this is
+/// the price of putting a window there, against the price of a window in
+/// the PC's memory that the card then reads over the bus instead.
+static WINDOW_FILL: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// For the frame-rate line: where the bytes of windows outside buffers lie
+/// (`VICTORY_WINDOWS_BAR_MB`, `VICTORY_CARD_WINDOWS_MB`), and what filling
+/// them costs. A window is memory the title's own allocator hands to draws
+/// for vertices, indices and constants; windows are two thirds of the PC
+/// memory the card reads over the bus, so where they lie is what a console's
+/// one memory comes to here.
+///
+/// "for want of room under the cap" is the number to watch: those windows
+/// would be in card memory if `VICTORY_WINDOWS_BAR_MB` were larger, and
+/// their bytes say by how much. "with the card's budget tight" instead
+/// means the card is full and a larger cap would change nothing.
+pub(crate) fn windows_line(frames: f64) {
+    let p: Vec<u64> = WINDOW_PLACE.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    if p.iter().all(|&v| v == 0) {
+        return;
+    }
+    let mb = |v: f64| v / (1 << 20) as f64;
+    let all = (p[place::IN_PLACE + 1] + p[place::BAR + 1] + p[place::ON_CARD + 1] + p[place::IN_PC + 1]) as f64;
+    let share = |bytes: u64| if all == 0.0 { 0.0 } else { bytes as f64 * 100.0 / all };
+    let f: Vec<f64> = WINDOW_FILL.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "windows outside buffers, by where their bytes lie (VICTORY_WINDOWS_BAR_MB={}): {} in the title's own memory in place \
+         ({:.0} MB, {:.0}%), {} in card memory the CPU maps ({:.0} MB, {:.0}%; {:.0} MB of them alive now, at most {:.0} MB at \
+         one time of the {} MB allowed), {} in the card's own memory with a CPU side ({:.0} MB, {:.0}%), {} in the PC's memory \
+         ({:.0} MB, {:.0}%); the BAR turned down {} for want of room under the cap ({:.0} MB: a larger cap would take them) and \
+         {} with the card's budget tight ({:.0} MB: the card is full), and {} buffers the host refused; filling windows per \
+         frame: {:.2} ms {:.2} MB over the bus into the BAR, {:.2} ms {:.2} MB in the PC's memory",
+        window_mapped_most() >> 20,
+        p[place::IN_PLACE],
+        mb(p[place::IN_PLACE + 1] as f64),
+        share(p[place::IN_PLACE + 1]),
+        p[place::BAR],
+        mb(p[place::BAR + 1] as f64),
+        share(p[place::BAR + 1]),
+        mb(WINDOW_MAPPED_BYTES.load(Ordering::Relaxed) as f64),
+        mb(WINDOW_MAPPED_MOST.load(Ordering::Relaxed) as f64),
+        window_mapped_most() >> 20,
+        p[place::ON_CARD],
+        mb(p[place::ON_CARD + 1] as f64),
+        share(p[place::ON_CARD + 1]),
+        p[place::IN_PC],
+        mb(p[place::IN_PC + 1] as f64),
+        share(p[place::IN_PC + 1]),
+        p[place::NO_ROOM],
+        mb(p[place::NO_ROOM + 1] as f64),
+        p[place::NO_BUDGET],
+        mb(p[place::NO_BUDGET + 1] as f64),
+        p[place::REFUSED],
+        f[0] / 1000.0,
+        mb(f[1]),
+        f[2] / 1000.0,
+        mb(f[3]),
+    );
+}
 
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
@@ -504,15 +780,23 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        window_placed(place::NO_BUDGET, size);
+        window_wanted(size);
         return None;
     }
-    if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+    let alive = WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    if alive > most {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        window_placed(place::NO_ROOM, size);
         return None;
     }
+    WINDOW_MAPPED_MOST.fetch_max(alive, Ordering::Relaxed);
     let made = host.mapped_card_buffer(size, true);
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        window_placed(place::REFUSED, size);
+    } else {
+        window_placed_on_card(size);
     }
     made
 }
@@ -540,6 +824,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        window_wanted(size);
         return None;
     }
     if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
@@ -549,6 +834,8 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    } else {
+        window_placed_on_card(size);
     }
     buffer
 }
@@ -4062,8 +4349,23 @@ impl Shadow {
         to - from
     }
 
-    /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
+    /// Copies title memory `[from, to)`, cut to the buffer, into the copy;
+    /// for a window outside buffers, timed by where its bytes lie
+    /// ([`WINDOW_FILL`]).
     fn copy(&self, from: usize, to: usize) -> usize {
+        if !self.window {
+            return self.copy_into(from, to);
+        }
+        let started = std::time::Instant::now();
+        let filled = self.copy_into(from, to);
+        let which = if self.mapped { 0 } else { 2 };
+        WINDOW_FILL[which].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        WINDOW_FILL[which + 1].fetch_add(filled as u64, Ordering::Relaxed);
+        filled
+    }
+
+    /// [`Shadow::copy`] itself.
+    fn copy_into(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
@@ -4759,11 +5061,54 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     map
 }
 
+/// [`BUFFERS`] to write, WITHOUT telling the threads' memories to start
+/// again ([`FOUND`]).
+///
+/// Only for taking an entry's copy from `None` to `Some`: that is what
+/// [`lookup`] does on the way past a buffer whose copy was not made yet,
+/// and it cannot make any remembered answer wrong. A remembered answer is
+/// a `Weak` of a copy that was handed out; filling in a different entry
+/// does not touch it, and this entry had no copy to remember.
+///
+/// Everything that can make one wrong keeps [`buffers`]: a buffer
+/// registered or unregistered (the map's shape), and a copy TAKEN BACK
+/// (`entry.shadow.take()`), which [`found`]'s fence and second read of the
+/// count lean on.
+///
+/// Why: with the count raised on every write lock, `lookup`'s own fill
+/// path cleared every thread's memory of every ask, and the fills are
+/// constant while the world streams. victory-fork raises its count
+/// (`tables_changed`) only where the tables really change, and reports
+/// 89 % of asks answered without the lock against the 52.7 % measured here.
+fn buffers_filling() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
 /// How often [`BUFFERS`] was taken to be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
-/// Answers a thread remembers.
-const FOUND_MOST: usize = 1024;
+/// Answers a thread remembers (`VICTORY_QUICK_FIND_SLOTS` sets it).
+///
+/// Was 1024, direct-mapped, so the same slot was reused by unrelated asks
+/// and the memory was thrown away before it was asked for again.
+/// victory-fork's equivalent (`VICTORY_LOOKUP_CACHE`, its pull request
+/// #1237) keeps 8192 and reports 540,000 asks a frame with 89 % answered
+/// without the tables' lock, worth about 14 ms a frame on its card. A slot
+/// is 32 bytes, so 8192 is 256 KB on each recording thread.
+fn found_most() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_QUICK_FIND_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| n.is_power_of_two())
+            .unwrap_or(8192)
+    })
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables.
+pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -4784,7 +5129,8 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    // The high bits, then the table's size: `found_most` is a power of two.
+    (h >> 32) as usize & (found_most() - 1)
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
@@ -4806,7 +5152,7 @@ fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
         if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+            f.resize_with(found_most(), || (0, 0, 0, std::sync::Weak::new()));
         }
         f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
     });
@@ -4836,7 +5182,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -4927,8 +5273,10 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
         return Some(shadow);
     }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
     let end = address.checked_add(len.max(1))?;
     {
         let map = buffers_read();
@@ -4948,7 +5296,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
         }
     }
-    let mut map = buffers();
+    // Only fills a copy in, so the threads' memories stay ([`buffers_filling`]).
+    let mut map = buffers_filling();
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -5278,6 +5627,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
+        window_placed(place::IN_PLACE, len);
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -5285,6 +5635,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
+        window_placed(place::BAR, len);
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5311,9 +5662,13 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 touched: Default::default(),
                 size: len,
             };
+            window_placed(place::ON_CARD, len);
             (on_card, Some(card))
         }
-        None => (buffer, None),
+        None => {
+            window_placed(place::IN_PC, len);
+            (buffer, None)
+        }
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5403,6 +5758,17 @@ pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
+    let [quick, tables] = [0, 1].map(|i| LOOKUPS[i].swap(0, Ordering::Relaxed));
+    if quick + tables > 0 {
+        tracing::info!(
+            "asks for a buffer's host copy per frame (VICTORY_QUICK_FIND, {} slots a thread): \
+             {:.0} answered from the thread's own memory ({:.1} %), {:.0} went to the tables' lock",
+            found_most(),
+            quick as f64 / frames,
+            100.0 * quick as f64 / (quick + tables).max(1) as f64,
+            tables as f64 / frames
+        );
+    }
     let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
@@ -5558,7 +5924,7 @@ mod window_tests {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
