@@ -28,6 +28,9 @@ const SIXTIETH: Duration = Duration::from_micros(16_667);
 struct Clock {
     start: Instant,
     interval: Duration,
+    /// The interval the title set (ours differs under a frame rate cap of
+    /// our own, [`capped`]).
+    title: Duration,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
 }
@@ -37,6 +40,34 @@ static FRAME: AtomicU64 = AtomicU64::new(0);
 
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The interval frames begin at, given the one the title set: the title's own
+/// unless a frame rate cap is asked for (`VICTORY_FRAME_CAP=<frames a second>`,
+/// 30 to 240, or the live menus' "Frame rate cap"). The title asks for 33,333 us
+/// (30 a second) and waits for our flip event before each present; a frame that
+/// is ready sooner slept to that tick, so the layer never showed more than 30
+/// however little a frame cost. The title steps its world by its own clock, so
+/// a shorter interval shows more frames and does not run the game faster. A cap
+/// of 30 is the title's own interval.
+fn capped(title: Duration) -> Duration {
+    static ASKED: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
+        let cap = std::env::var("VICTORY_FRAME_CAP").ok()?.trim().parse::<f32>().ok()?;
+        let good = (30.0..=240.0).contains(&cap);
+        if good {
+            tracing::info!(cap, "VICTORY_FRAME_CAP: frames begin at this rate at most, not the title's");
+        } else {
+            tracing::warn!(cap, "VICTORY_FRAME_CAP outside 30..=240: ignored");
+        }
+        good.then_some(cap)
+    });
+    #[cfg(windows)]
+    let asked = crate::live::get(crate::live::FRAME_CAP).or(asked);
+    match asked {
+        Some(cap) if cap > 30.5 => Duration::from_secs_f32(1.0 / cap.clamp(30.0, 240.0)),
+        _ => title,
+    }
 }
 
 /// Device method: a frame every `length` microseconds. The period is how
@@ -49,11 +80,12 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let title = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let interval = capped(title);
+    tracing::info!(?interval, ?title, "frame interval");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -63,6 +95,7 @@ pub(crate) extern "system" fn set_interval(
     *clock() = Some(Clock {
         start: Instant::now(),
         interval,
+        title,
         first,
     });
     S_OK
@@ -106,8 +139,18 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
         interval: SIXTIETH,
+        title: SIXTIETH,
         first: 0,
     });
+    // A cap changed in the live menus: a new interval starts from now, after
+    // the last tick handed out, as when the title sets one.
+    let wanted = capped(c.title);
+    if wanted != c.interval {
+        tracing::info!(interval = ?wanted, title = ?c.title, "frame interval: the frame rate cap changed");
+        c.first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+        c.start = Instant::now();
+        c.interval = wanted;
+    }
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =

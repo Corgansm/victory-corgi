@@ -50,7 +50,8 @@ pub(crate) const WINDOWS_BAR_MB: usize = 6;
 pub(crate) const PANEL: usize = 7;
 pub(crate) const DXR: usize = 8;
 pub(crate) const RAY_TRACING: usize = 9;
-const COUNT: usize = 10;
+pub(crate) const FRAME_CAP: usize = 10;
+const COUNT: usize = 11;
 
 fn env_number(name: &str) -> Option<f32> {
     std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite())
@@ -180,6 +181,16 @@ pub(crate) const SPECS: [Spec; COUNT] = [
                 0.0
             }
         },
+    },
+    Spec {
+        name: "VICTORY_FRAME_CAP",
+        label: "Frame rate cap (30: title's)",
+        least: 30.0,
+        most: 120.0,
+        step: 5.0,
+        switch: false,
+        // (`crate::frame`: the title's own interval is 30 a second.)
+        start: || env_number("VICTORY_FRAME_CAP").filter(|v| (30.0..=240.0).contains(v)).unwrap_or(30.0),
     },
 ];
 
