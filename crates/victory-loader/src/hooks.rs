@@ -187,10 +187,18 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
     patches
 }
 
-/// The scale `VICTORY_RENDER_SCALE` asks for, if valid.
+/// The smallest render scale the title starts with: 0.39 of 1920x1080 is the
+/// low-spec copy's own 748x421. At 0.2 (384x216) the title read through a null
+/// pointer just past the loading screen (run 20261126-201251, its code at
+/// +0x28e3ef1) and its own crash reporter ran; sizes between are untested. A
+/// smaller scale asked for is raised to this.
+pub(crate) const LEAST_RENDER_SCALE: f32 = 0.39;
+
+/// The scale `VICTORY_RENDER_SCALE` asks for, if valid (from 0.2), raised to
+/// [`LEAST_RENDER_SCALE`].
 fn parse_scale(text: &str) -> Option<f32> {
     let v: f32 = text.trim().parse().ok()?;
-    (0.2..=1.0).contains(&v).then_some(v)
+    (0.2..=1.0).contains(&v).then_some(v.max(LEAST_RENDER_SCALE))
 }
 
 /// Applies the resolution levers asked for in the environment
@@ -199,7 +207,10 @@ fn parse_scale(text: &str) -> Option<f32> {
 /// # Safety
 /// As `disarm_watchdog`.
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
-    let scale = std::env::var(RENDER_SCALE_ENV).ok();
+    // The live menus' render scale (`VICTORY_LIVE_FILE`) comes before the
+    // variable: the title works its render size out once, as it starts, so
+    // the menus set it for the next start.
+    let scale = live_file_scale().map(|v| v.to_string()).or_else(|| std::env::var(RENDER_SCALE_ENV).ok());
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
     if scale.is_none() && !own {
         return 0;
@@ -220,6 +231,12 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         match parse_scale(&text) {
             Some(scale) => {
                 // With the own upscaler forced, FSR is left as it is.
+                // The low-spec copy's own upscaler gives a fixed height
+                // whatever the scale: it is given one that keeps the scale.
+                if own {
+                    // SAFETY: forwarded from this function's contract.
+                    applied += usize::from(unsafe { scaled_render_size(base) });
+                }
                 for p in render_scale_patches(base, scale, !own) {
                     let p = Patch {
                         what: p.what,
@@ -237,23 +254,72 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     applied
 }
 
-/// The title's own upscaler (type 6), a global object of the 1.0.2.1
-/// executable, and its vtable: the size function
-/// (RVA `0x1de4030`) asks it for the render size, which it keeps in
-/// [`RENDER`], from the output size it keeps in [`OUTPUT`]; the render
-/// targets are made at [`LARGEST`].
-const OWN_UPSCALER_OBJECT: usize = 0x7b9_9040;
-const OWN_UPSCALER_VTABLE: usize = 0x630_0bf0;
+/// The start of the low-spec copy's render size for the title's own
+/// upscaler (`scarlett_lowspec.py`, at RVA `0x7e9440`: `mov r10d, [rsp+0x28];
+/// test r10d, r10d; jz`), a fixed height whatever the scale, and the room it
+/// has (to the function after it).
+const LOWSPEC_RENDER_SIZE: [u8; 9] = [0x44, 0x8B, 0x54, 0x24, 0x28, 0x45, 0x85, 0xD2, 0x74];
+const RENDER_SIZE_RVA: usize = 0x7e_9440;
+const RENDER_SIZE_ROOM: usize = 0x4d;
+
+/// Ours in its place, as the title's own does without its clamp: the output
+/// size (`r9d`, `[rsp+0x28]`) times the upscaler's scale (`[rcx+0x90]`),
+/// the width even, into `[rdx]` and `[r8]`.
+const SCALED_RENDER_SIZE: [u8; 44] = [
+    0xC5, 0xFA, 0x10, 0x81, 0x90, 0x00, 0x00, 0x00, // vmovss xmm0, [rcx+0x90]
+    0xC4, 0xC1, 0x72, 0x2A, 0xC9, // vcvtsi2ss xmm1, xmm1, r9d
+    0xC5, 0xF2, 0x59, 0xC8, // vmulss xmm1, xmm1, xmm0
+    0xC5, 0xFA, 0x2C, 0xC1, // vcvttss2si eax, xmm1
+    0x83, 0xE0, 0xFE, // and eax, -2
+    0x89, 0x02, // mov [rdx], eax
+    0xC5, 0xF2, 0x2A, 0x4C, 0x24, 0x28, // vcvtsi2ss xmm1, xmm1, [rsp+0x28]
+    0xC5, 0xF2, 0x59, 0xC8, // vmulss xmm1, xmm1, xmm0
+    0xC5, 0xFA, 0x2C, 0xC1, // vcvttss2si eax, xmm1
+    0x41, 0x89, 0x00, // mov [r8], eax
+    0xC3, // ret
+];
+
+/// On the low-spec copy, [`SCALED_RENDER_SIZE`] over its fixed height
+/// (padded with `int3`). False on any other image.
+///
+/// # Safety
+/// As `disarm_watchdog`.
+unsafe fn scaled_render_size(base: usize) -> bool {
+    let at = (base + RENDER_SIZE_RVA) as *const u8;
+    // SAFETY: inside the mapped .text of the 1.0.2.1 executable.
+    let head = unsafe { std::slice::from_raw_parts(at, LOWSPEC_RENDER_SIZE.len()) };
+    if head != LOWSPEC_RENDER_SIZE {
+        return false;
+    }
+    // SAFETY: as above.
+    let expect = unsafe { std::slice::from_raw_parts(at, RENDER_SIZE_ROOM) }.to_vec();
+    let mut new = SCALED_RENDER_SIZE.to_vec();
+    new.resize(RENDER_SIZE_ROOM, 0xCC);
+    let p = Patch { what: "render scale: the low-spec copy's render size keeps the scale", rva: RENDER_SIZE_RVA, expect: &expect, new: &new };
+    // SAFETY: forwarded from this function's contract.
+    unsafe { apply(base, &p) }
+}
+
+/// `VICTORY_RENDER_SCALE=` in the live file (`VICTORY_LIVE_FILE`), as the
+/// menus left it, if valid.
+fn live_file_scale() -> Option<f32> {
+    let file = std::env::var_os("VICTORY_LIVE_FILE").filter(|v| !v.is_empty())?;
+    read_scale(std::path::Path::new(&file)).filter(|v| (0.2..=1.0).contains(v)).map(|v| v.max(LEAST_RENDER_SCALE))
+}
+
+/// The title's sizes: the size function (RVA `0x1de4030`) asks its upscaler
+/// for the render size, which it keeps in [`RENDER`], from the output size
+/// it keeps in [`OUTPUT`]; the render targets are made at [`LARGEST`].
 const OUTPUT: [usize; 2] = [0x8fd_c560, 0x91a_c9fc];
 const RENDER: [usize; 2] = [0x99f_ecf8, 0x99f_ecfc];
 const LARGEST: [usize; 2] = [0x8fd_c558, 0x8fd_c55c];
 
-/// The live menus' render scale (`VICTORY_LIVE_FILE`, victory-gpu's `live`):
-/// a thread of ours puts the size it asks for into the title's render size,
-/// no larger than its render targets, again whenever the title works it out
-/// anew. Only with the title's own upscaler (`VICTORY_OWN_UPSCALER=1`): FSR
-/// takes one size only. It writes `<file>.render` with the sizes (render,
-/// output, largest) for the menus. Returns whether it started.
+/// For the live menus (`VICTORY_LIVE_FILE`, victory-gpu's `live`): a thread
+/// of ours writes `<file>.render` with the title's render, output and largest
+/// sizes whenever they change. (The render size itself is set as the title
+/// starts, [`resolution_levers`]: the title makes its tile grids and targets
+/// for it once, and a size changed while it runs breaks its pictures.)
+/// Returns whether it started.
 ///
 /// # Safety
 /// As `disarm_watchdog`; the image stays mapped while the process runs.
@@ -266,7 +332,7 @@ pub(crate) unsafe fn live_render_scale(base: usize, hash: &blake3::Hash) -> bool
         return false;
     }
     let file = std::path::PathBuf::from(file);
-    std::thread::Builder::new().name("victory-live-render-scale".into()).spawn(move || render_scale_loop(base, &file)).is_ok()
+    std::thread::Builder::new().name("victory-live-render-size".into()).spawn(move || render_size_loop(base, &file)).is_ok()
 }
 
 /// A `u32` of the title's memory at `rva`.
@@ -278,70 +344,25 @@ unsafe fn word(base: usize, rva: usize) -> u32 {
     unsafe { std::ptr::read_volatile((base + rva) as *const u32) }
 }
 
-fn render_scale_loop(base: usize, file: &std::path::Path) {
-    let started = std::time::SystemTime::now();
+fn render_size_loop(base: usize, file: &std::path::Path) {
     let mut render_file = file.to_path_buf().into_os_string();
     render_file.push(".render");
     let render_file = std::path::PathBuf::from(render_file);
-    // The file's value last read, and the scale a change asked for.
-    let (mut seen, mut wanted): (Option<f32>, Option<f32>) = (None, None);
     let mut said = [0u32; 6];
-    let mut warned = false;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         // SAFETY: globals of the mapped 1.0.2.1 executable.
-        let (output, render, largest) = unsafe {
-            (
-                [word(base, OUTPUT[0]), word(base, OUTPUT[1])],
-                [word(base, RENDER[0]), word(base, RENDER[1])],
-                [word(base, LARGEST[0]), word(base, LARGEST[1])],
-            )
+        let sizes = unsafe {
+            [
+                word(base, RENDER[0]),
+                word(base, RENDER[1]),
+                word(base, OUTPUT[0]),
+                word(base, OUTPUT[1]),
+                word(base, LARGEST[0]),
+                word(base, LARGEST[1]),
+            ]
         };
-        let ready = output[0] > 0 && output[1] > 0 && largest[0] > 0 && largest[1] > 0;
-        // (Only a file written in this run: victory-gpu writes it at its start.)
-        let written_now = std::fs::metadata(file).and_then(|m| m.modified()).is_ok_and(|m| m >= started);
-        if written_now && let Some(v) = read_scale(file) {
-            let title = (render[0] as f32) / (output[0].max(1) as f32);
-            match seen {
-                None => seen = Some(v),
-                Some(s) if (s - v).abs() > 1e-4 => {
-                    seen = Some(v);
-                    // (The menus starting from the title's own scale is no change.)
-                    if !ready || (v - title).abs() > 0.006 || wanted.is_some() {
-                        wanted = Some(v.clamp(0.2, 1.0));
-                    }
-                }
-                _ => {}
-            }
-        }
-        if let Some(scale) = wanted.filter(|_| ready) {
-            // SAFETY: plain reads of the mapped image's code and data.
-            let own = unsafe {
-                std::slice::from_raw_parts((base + OWN_UPSCALER.rva) as *const u8, 3) == OWN_UPSCALER.new
-                    && std::ptr::read_volatile((base + OWN_UPSCALER_OBJECT) as *const usize) == base + OWN_UPSCALER_VTABLE
-            };
-            if own {
-                let w = ((output[0] as f32 * scale) as u32 & !1).clamp(16, largest[0]);
-                let h = ((output[1] as f32 * scale) as u32).clamp(16, largest[1]);
-                if render != [w, h] {
-                    // SAFETY: the title's render size, two aligned globals it
-                    // reads; written whole.
-                    unsafe {
-                        std::ptr::write_volatile((base + RENDER[0]) as *mut u32, w);
-                        std::ptr::write_volatile((base + RENDER[1]) as *mut u32, h);
-                        std::ptr::write_volatile((base + OWN_UPSCALER_OBJECT + 0x90) as *mut f32, scale);
-                    }
-                    tracing::info!(scale, width = w, height = h, "live render scale: the title's render size set");
-                }
-            } else if !warned {
-                warned = true;
-                tracing::warn!("live render scale: not with FSR (set VICTORY_OWN_UPSCALER=1); left as the title has it");
-            }
-        }
-        // SAFETY: as above.
-        let render = unsafe { [word(base, RENDER[0]), word(base, RENDER[1])] };
-        let sizes = [render[0], render[1], output[0], output[1], largest[0], largest[1]];
-        if ready && sizes != said {
+        if sizes.iter().all(|&v| v > 0) && sizes != said {
             said = sizes;
             let text = sizes.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
             let _ = std::fs::write(&render_file, text);

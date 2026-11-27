@@ -87,6 +87,34 @@ pub const MEMORY_FAULTS: u32 = 4096;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
+/// Slots of the memory copies' run from its base: the null view and the
+/// copies' views ([`USER_MEMORY_BASE`]). Native ray tracing
+/// (`VICTORY_DXR_GUIDED`) has the next slots: its table of host structures
+/// at `base + MEMORY_RUN` (a raw view of [`DXR_ENTRIES`] entries of four
+/// dwords: the low dword of its root's absolute node pointer, `(address >>
+/// 3) + root` (0: empty; the title's walks use the 64-bit node test with a
+/// base of 0), its kind ([`DXR_TOP`] or [`DXR_BOTTOM`]) << 30 | its
+/// acceleration structure's number, that pointer's high dword, and its
+/// instance list's (top) or
+/// elements' (bottom) byte offset), and the acceleration structures' views
+/// at `base + MEMORY_RUN + 1 + number`, [`DXR_STRUCTURES`] of them.
+pub const MEMORY_RUN: u32 = 1 << 12;
+/// See [`MEMORY_RUN`]. A power of two: an entry's place is the address's
+/// hash, then the next three.
+pub const DXR_ENTRIES: u32 = 1 << 10;
+/// See [`MEMORY_RUN`]. After the structures' views, at
+/// `base + MEMORY_RUN + 1 + DXR_STRUCTURES`: the guided walk's counters (a
+/// raw view; dword 0 its queries, 1 those that hit, 2 those at a top level).
+pub const DXR_STRUCTURES: u32 = (1 << 10) - 1;
+/// See [`MEMORY_RUN`]: a top level, its acceleration structure the host's
+/// top level of it (instance `k`'s id the record's number in its list).
+pub const DXR_TOP: u32 = 1;
+/// See [`MEMORY_RUN`]: a bottom level, its acceleration structure a host
+/// top level of one instance of the host's bottom level of it.
+pub const DXR_BOTTOM: u32 = 2;
+/// The multiplier of the table's hash: `key * DXR_HASH >> 22`, the key
+/// the root's absolute pointer's low dword ([`MEMORY_RUN`]).
+pub const DXR_HASH: u32 = 0x9E37_79B1;
 /// `RootType::Other` code of a user-data dword the host computes: the low
 /// 32 bits of the title address of the buffer view at dword `dword` of the
 /// descriptor table of root parameter `slot`; [`USER_VIEW_ADDRESS`] + 1:
@@ -132,6 +160,8 @@ pub(crate) mod flags {
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
     pub const SAMPLER_HEAP: u64 = 1 << 31;
+    /// Inline ray queries (ray tracing tier 1.1).
+    pub const RAY_QUERY: u64 = 1 << 25;
 }
 
 pub(crate) struct Types {
@@ -595,6 +625,7 @@ impl Shader {
                 (flags::RESOURCE_HEAP, used.heap_views),
                 (flags::SAMPLER_HEAP, used.heap_samplers),
                 (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+                (flags::RAY_QUERY, used.ray_query),
             ] {
                 if !used {
                     self.flags &= !flag;
@@ -954,6 +985,10 @@ impl Shader {
         }
         if self.flags & flags::ATOMIC_HEAP64 != 0 {
             features |= 0x1000_0000;
+        }
+        // (Ray tracing tier 1.1.)
+        if self.flags & flags::RAY_QUERY != 0 {
+            features |= 0x10_0000;
         }
         let sfi0 = features.to_le_bytes();
         let isg1 = container::signature(&self.inputs, true);

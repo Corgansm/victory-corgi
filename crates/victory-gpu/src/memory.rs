@@ -219,6 +219,9 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// Work of ours was recorded on the list (native ray tracing): its
+    /// compute root signature and pipeline are to be set again.
+    pub(crate) clobbered: bool,
 }
 
 impl Memory {
@@ -1038,9 +1041,12 @@ pub(crate) fn ready(
         Some(&run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
+            // (And native ray tracing's table and structures' views,
+            // `victory_shader::emit::MEMORY_RUN`.)
+            let run = COPIES + 3 + victory_shader::emit::DXR_STRUCTURES;
+            let base = heap.dynamic(run)?;
             // Every slot of the run: a number shows no view of another kind.
-            for n in 0..=COPIES {
+            for n in 0..run {
                 heap.null_raw_uav_at(base + n);
             }
             (base, 0)
@@ -1051,6 +1057,9 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
+    if use_ == Use::Reads && dxr::on() {
+        m.dxr_views(heap, base);
+    }
     // Every copy by every list that has come to by-address memory, whoever
     // numbered it: an arena another list made while this one was being
     // recorded was brought up to date by that list's submission alone, which
@@ -1071,22 +1080,38 @@ pub(crate) fn ready(
         m.dump.walked(addresses);
     }
     // After the pages are brought up, so the reads see this frame's.
-    if use_ == Use::Reads && dxr::on() {
-        m.dxr_tops(list, addresses);
-    }
+    let clobbered = use_ == Use::Reads && dxr::on() && m.dxr_tops(list, addresses);
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
         faults: m.faults.2,
         base,
+        clobbered,
     })
 }
 
-/// Native ray tracing, its first stage (`VICTORY_DXR=1`; off by default): the
-/// top levels the trace programs are given and the bottom levels their
-/// instances name, read back from the card a few frames later, and a line
-/// every ten seconds of what a host (DXR) structure of them would hold. No
-/// structure is built yet (`DXR-PLAN.md`, step 2).
+/// Native ray tracing (`VICTORY_DXR=1`; off by default; `DXR-PLAN.md`), its
+/// second stage: host (DXR) structures built from the title's own.
+///
+/// - The top levels the trace programs are given and the bottom levels their
+///   instances name are read back from the card a few frames later (their
+///   headers and the top levels' instance lists).
+/// - A bottom level of the plain kind (version 6, not packed) is built as a
+///   host bottom level: its elements (64 bytes, up to four triangles each)
+///   are copied from title memory to a buffer of ours, a pass of ours turns
+///   each into four triangles (an absent one's vertices NaN: inactive), and
+///   the host builds the structure from them. Rehydrated (static) ones once
+///   (again if their header changes), the others every [`dxr::AGAIN`]
+///   frames; at most [`dxr::BUILDS`] a frame.
+/// - A top level is built from its instances whose bottom level is built,
+///   with each instance's transform the inverse of the title's world to
+///   object matrix, its id and mask as the title has them.
+///
+/// Nothing traces them yet (that is stage 4: the trace programs' walk led
+/// through them): a line every ten seconds says what is built and its cost.
+/// The work goes on the list of the trace dispatch it comes before (so it
+/// sees this frame's title memory), and replaces the list's compute root
+/// signature and pipeline ([`Ready::clobbered`]).
 mod dxr {
     use super::*;
 
@@ -1104,10 +1129,40 @@ mod dxr {
     pub(super) const BOTTOMS: usize = 4096;
     /// Frames before a read is looked at.
     pub(super) const LATER: u64 = 3;
+    /// Frames before a bottom level that is not static is built again.
+    pub(super) const AGAIN: u64 = 60;
+    /// Host bottom levels built at most a frame.
+    pub(super) const BUILDS: usize = 4;
+    /// The most elements of a bottom level built (bigger ones are left out;
+    /// the biggest in the dumps had some 30,000).
+    pub(super) const MOST_ELEMENTS: u32 = 1 << 16;
+    /// The most bytes of host bottom levels kept: more are not built.
+    pub(super) const MOST_KEPT: u64 = 512 << 20;
+    /// No building while the card's memory in use is over this share of its
+    /// budget: a run that built on with it full (8.1 of 9.6 GB) lost the
+    /// device two minutes in, the submitting thread stalled 4.8 s first
+    /// (with headers that claimed billions of elements built; those are not
+    /// any more). At 85% the top level held 54 of 1,512 instances (run
+    /// 20261126-180001).
+    pub(super) const CARD_SHARE: f64 = 0.93;
+    const _: () = assert!(victory_shader::emit::MEMORY_RUN == super::COPIES + 1);
+    /// Frames between a structure's build being recorded and its view and
+    /// table entry being set: a list recorded or still running before the
+    /// build finished would trace memory that holds no structure yet (the
+    /// card hangs: run 20261126-165057, the driver's event 153).
+    pub(super) const PUBLISH_AFTER: u64 = 10;
+    /// Frames a structure let go is kept: lists in flight and the host top
+    /// levels made before it was replaced may still use it.
+    pub(super) const KEEP_AFTER: u64 = 120;
+    /// Frames of building after which a top level not built again is taken
+    /// out of the guided walk's table (`Memory::dxr_frame`).
+    pub(super) const STALE_TOP: u64 = 1800;
 
     pub(super) enum What {
         Top(u64),
         Bottoms(Vec<u64>),
+        /// The guided walk's counters.
+        Counters,
     }
 
     pub(super) struct Pending {
@@ -1126,15 +1181,129 @@ mod dxr {
         pub(super) frame: u64,
     }
 
+    /// An instance of a top level: the title's world to object matrix
+    /// (dwords 0-11), its id and mask (12), flags (13), and its bottom level.
+    #[derive(Clone, Copy)]
+    pub(super) struct Instance {
+        pub(super) words: [u32; 14],
+        pub(super) bottom: u64,
+        /// Its number in the title's list (the host instance's id: the
+        /// guided walk's instance node, `victory_shader` `bvh_guided`).
+        pub(super) record: u32,
+        /// Its root pointer (record dword 14).
+        pub(super) root_pointer: u32,
+    }
+
+    /// A top level as last read: the frame, its instances and how many it
+    /// says it has.
+    #[derive(Default)]
+    pub(super) struct Top {
+        pub(super) read: u64,
+        pub(super) instances: Vec<Instance>,
+        pub(super) count: u32,
+        /// Its header's root node pointer and instance list offset.
+        pub(super) root: [u32; 2],
+        /// Its host top level and the instances in it.
+        pub(super) built: Option<(ID3D12Resource, usize)>,
+        /// The frame its host top level was built.
+        pub(super) built_frame: u64,
+    }
+
+    /// A host bottom level: the title's header it was built from, the frame,
+    /// its structure and triangles.
+    pub(super) struct Built {
+        pub(super) header: [u32; 16],
+        pub(super) frame: u64,
+        pub(super) structure: ID3D12Resource,
+        pub(super) bytes: u64,
+        pub(super) triangles: u64,
+        /// A host top level of it alone (identity, mask 0xff), for the
+        /// guided walk at its root.
+        pub(super) single: Option<ID3D12Resource>,
+    }
+
+    /// The element pass.
+    pub(super) struct Pass {
+        pub(super) root: ID3D12RootSignature,
+        pub(super) pso: ID3D12PipelineState,
+        pub(super) device: ID3D12Device5,
+    }
+
     #[derive(Default)]
     pub(super) struct Dxr {
         pub(super) pending: Vec<Pending>,
-        /// Top level address: the frame it was last read in, its instances'
-        /// bottom levels and how many instances.
-        pub(super) tops: HashMap<u64, (u64, Vec<u64>, u32)>,
+        pub(super) tops: HashMap<u64, Top>,
         pub(super) bottoms: HashMap<u64, Bottom>,
         pub(super) reported: Option<std::time::Instant>,
+        /// Tops read, tops looked at, bottom headers read, not there.
         pub(super) stats: [u64; 4],
+        /// `None` until first wanted; `Some(None)` if it cannot be made.
+        pub(super) pass: Option<Option<Pass>>,
+        pub(super) built: HashMap<u64, Built>,
+        /// Since the last line: bottom levels built, their triangles, top
+        /// levels built, the time recording them took (us), and the most
+        /// scratch one took.
+        pub(super) period: [u64; 5],
+        /// Bottom levels left out: too big, or failed.
+        pub(super) left_out: u64,
+        /// Frames building waited for the card's memory.
+        pub(super) card_full: u64,
+        /// The table of host structures the guided walk looks in
+        /// (`victory_shader::emit::MEMORY_RUN`): its buffer and mapping.
+        pub(super) table: Option<(ID3D12Resource, usize)>,
+        /// Structure address -> its number (its view's place in the run).
+        pub(super) numbers: HashMap<u64, u32>,
+        /// Each number's acceleration structure and when it was set.
+        pub(super) structures: Vec<Option<(ID3D12Resource, u64)>>,
+        /// Bumped whenever a number's structure is set.
+        pub(super) generation: u64,
+        /// Per view heap: when its views were last written.
+        pub(super) views: HashMap<usize, u64>,
+        /// Structures built but not published yet: the frame they may be
+        /// ([`PUBLISH_AFTER`]), their address, kind, root and offset.
+        pub(super) unpublished: Vec<(u64, u64, u32, [u32; 2], ID3D12Resource)>,
+        /// Structures let go and the frame: kept [`KEEP_AFTER`] frames for
+        /// the lists and the top levels that may still use them.
+        pub(super) retired: Vec<(u64, ID3D12Resource)>,
+        /// Published top levels (address) and the frame each was built: a
+        /// top level names its bottom levels by address, so a bottom level let
+        /// go is kept while a top level built before it went is published.
+        /// With the live switch at 0 or 1 nothing is built, the top levels age,
+        /// and the bottom levels they name were freed after [`KEEP_AFTER`]
+        /// frames anyway: switched back to 2, the walk's first ray queries went
+        /// through freed memory (run 20261126-195949: 0, then 1 and 2, and the
+        /// card was lost within two seconds, NVIDIA events 13 and 153).
+        /// (Top levels not built again in [`STALE_TOP`] frames of building are
+        /// taken out of the table, so a top level the title no longer walks
+        /// does not keep every bottom level let go after it.)
+        pub(super) top_built: HashMap<u64, (u64, [u32; 2])>,
+        /// The guided walk's counters on the card (queries, hits, at a top
+        /// level: `victory_shader::emit::DXR_STRUCTURES`), the frame they
+        /// were last read and their values then, and their growth since the
+        /// last line.
+        pub(super) counters: Option<ID3D12Resource>,
+        /// Bottom levels published under a root pointer their instances use
+        /// (dword 14, with its marks) besides their header's: (address,
+        /// pointer) and the structure it was published with.
+        pub(super) instance_roots: HashMap<(u64, u32), ID3D12Resource>,
+        pub(super) counted: (u64, [u32; 3]),
+        pub(super) counted_period: [u64; 3],
+        /// The frame the card's memory was last asked about, and whether it
+        /// had room.
+        pub(super) room: (u64, bool),
+    }
+
+    /// A version-6 header of a bottom level of the two plain kinds the
+    /// dumps have (0x8002 rehydrated, 0x8004; not 0x8102, packed), with a
+    /// list of elements that fits in it. (Records past a top level's live
+    /// instances name stale memory: headers that claim billions.)
+    pub(super) fn usable_bottom(h: &[u32; 16]) -> bool {
+        h[0] & 0xffff == 6 && matches!(h[0] >> 16, 0x8002 | 0x8004) && h[3] > 0 && h[3] <= MOST_ELEMENTS && h[13] < 1 << 24
+    }
+
+    /// A bottom level the title made once (rehydrated): built once.
+    pub(super) fn static_bottom(h: &[u32; 16]) -> bool {
+        h[0] >> 16 & 2 != 0
     }
 
     impl Pending {
@@ -1149,9 +1318,161 @@ mod dxr {
         }
     }
 
-    /// A version-6 header of a bottom level (bit 31) that is not packed.
-    pub(super) fn usable_bottom(h: &[u32; 16]) -> bool {
-        h[0] & 0xffff == 6 && h[0] >> 31 == 1 && h[0] >> 16 & 0x100 == 0
+    /// Four slots an element: its triangles' three vertices, the slot's
+    /// corners by the triangle's id byte (`bvh_flat`'s tests check it
+    /// against the title's own walk on dumped structures).
+    pub(super) const ELEMENTS_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
+cbuffer C : register(b0) { uint first; uint count; };
+ByteAddressBuffer nodes : register(t0);
+RWByteAddressBuffer vertices : register(u0);
+static const uint MAP[4] = { 0x210u, 0x231u, 0x432u, 0x042u };
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint e = id.x;
+    if (e >= count) return;
+    uint at = first + 64u * e;
+    uint w[16];
+    [unroll] for (uint n = 0u; n < 16u; ++n) w[n] = nodes.Load(at + 4u * n);
+    [unroll] for (uint k = 0u; k < 4u; ++k) {
+        uint tri = (e * 4u + k) * 36u;
+        uint byte_ = (w[15] >> (8u * k)) & 0xffu;
+        if (byte_ == 0u) {
+            [unroll] for (uint d = 0u; d < 9u; ++d) vertices.Store(tri + 4u * d, 0x7fc00000u);
+            continue;
+        }
+        uint i = byte_ & 3u;
+        uint j = (byte_ >> 2u) & 3u;
+        uint order[3] = { (3u - i - j) & 3u, i, j };
+        [unroll] for (uint v = 0u; v < 3u; ++v) {
+            uint vertex = (MAP[k] >> (4u * order[v])) & 0xfu;
+            [unroll] for (uint c = 0u; c < 3u; ++c) {
+                vertices.Store(tri + 12u * v + 4u * c, w[3u * vertex + c]);
+            }
+        }
+    }
+}
+"#;
+
+    pub(super) fn make_pass() -> Option<Pass> {
+        let host = host()?;
+        let made = (|| -> windows::core::Result<Pass> {
+            let code = crate::host::compile(ELEMENTS_CS, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+            let device: ID3D12Device5 = windows::core::Interface::cast(&host.device)?;
+            // SAFETY: the compiled bytes, with the root signature in them.
+            unsafe {
+                let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code)?;
+                let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
+                    ..Default::default()
+                })?;
+                Ok(Pass { root, pso, device })
+            }
+        })();
+        match made {
+            Ok(pass) => Some(pass),
+            Err(e) => {
+                tracing::warn!(error = %e, "native ray tracing: the element pass could not be made; nothing is built");
+                None
+            }
+        }
+    }
+
+    /// A buffer in the card's own memory, in `state`.
+    pub(super) fn card_buffer(device: &ID3D12Device5, size: u64, state: D3D12_RESOURCE_STATES) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(256),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut buffer) }.ok()?;
+        buffer
+    }
+
+    pub(super) fn turn(resource: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: the same pointer, not counted; used while the
+                    // resource lives (the list keeps it).
+                    pResource: unsafe { std::mem::transmute_copy(resource) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
+    pub(super) fn uav(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: as in `turn`.
+                    pResource: unsafe { std::mem::transmute_copy(resource) },
+                }),
+            },
+        }
+    }
+
+    /// The inverse of an affine 3x4 matrix (rows), if it has one.
+    pub(super) fn invert(m: &[f32; 12]) -> Option<[f32; 12]> {
+        let [a, b, c, tx, d, e, f, ty, g, h, i, tz] = *m;
+        let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+        if !det.is_finite() || det.abs() < 1e-20 {
+            return None;
+        }
+        let r = 1.0 / det;
+        let n = [
+            (e * i - f * h) * r,
+            (c * h - b * i) * r,
+            (b * f - c * e) * r,
+            (f * g - d * i) * r,
+            (a * i - c * g) * r,
+            (c * d - a * f) * r,
+            (d * h - e * g) * r,
+            (b * g - a * h) * r,
+            (a * e - b * d) * r,
+        ];
+        let t = [
+            -(n[0] * tx + n[1] * ty + n[2] * tz),
+            -(n[3] * tx + n[4] * ty + n[5] * tz),
+            -(n[6] * tx + n[7] * ty + n[8] * tz),
+        ];
+        let out = [n[0], n[1], n[2], t[0], n[3], n[4], n[5], t[1], n[6], n[7], n[8], t[2]];
+        out.iter().all(|v| v.is_finite()).then_some(out)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn the_inverse_undoes_the_matrix() {
+            let m = [2.0, 0.0, 0.0, 5.0, 0.0, 0.0, -3.0, 1.0, 0.0, 4.0, 0.0, -2.0];
+            let n = super::invert(&m).unwrap();
+            let p = [1.5f32, -2.0, 7.0];
+            let apply = |m: &[f32; 12], p: [f32; 3]| {
+                [0, 1, 2].map(|r| m[4 * r] * p[0] + m[4 * r + 1] * p[1] + m[4 * r + 2] * p[2] + m[4 * r + 3])
+            };
+            let back = apply(&n, apply(&m, p));
+            for (a, b) in back.iter().zip(p) {
+                assert!((a - b).abs() < 1e-5, "{back:?}");
+            }
+        }
     }
 }
 
@@ -1172,26 +1493,12 @@ impl Memory {
                 // SAFETY: an entry of the directory.
                 let start = u64::from(unsafe { self.entry(page).add(1).read() });
                 let from = &self.copies[place].buffer;
-                let turn = |before, after| D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                            // SAFETY: the same pointer, not counted; used
-                            // while the arena lives.
-                            pResource: unsafe { std::mem::transmute_copy(from) },
-                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                            StateBefore: before,
-                            StateAfter: after,
-                        }),
-                    },
-                };
                 // SAFETY: an open list; live buffers; inside both (an arena
                 // page is a whole 64 KiB of the arena).
                 unsafe {
-                    list.list.ResourceBarrier(&[turn(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    list.list.ResourceBarrier(&[dxr::turn(from, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                     list.list.CopyBufferRegion(buffer, into + done, from, start + address % PAGE, n);
-                    list.list.ResourceBarrier(&[turn(D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                    list.list.ResourceBarrier(&[dxr::turn(from, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
                 }
                 got.push((into + done, n));
             }
@@ -1200,27 +1507,32 @@ impl Memory {
         got
     }
 
-    /// The top levels a trace dispatch is given: each read once a frame.
-    fn dxr_tops(&mut self, list: &HostList, addresses: &[u64]) {
-        let Some(host) = host() else { return };
+    /// Before a trace dispatch: the top levels it is given read once in a
+    /// while, and host structures built. True if the list's compute root
+    /// signature and pipeline were replaced.
+    fn dxr_tops(&mut self, list: &HostList, addresses: &[u64]) -> bool {
+        let Some(host) = host() else { return false };
         for &top in addresses {
-            if self.dxr.tops.get(&top).is_some_and(|t| t.0 + 30 > self.frame) || self.dxr.pending.len() > 64 {
+            if self.dxr.tops.get(&top).is_some_and(|t| t.read + 30 > self.frame) || self.dxr.pending.len() > 64 {
                 continue;
             }
             if self.dxr.pending.iter().any(|p| matches!(p.what, dxr::What::Top(a) if a == top)) {
                 continue;
             }
-            let Some((buffer, data)) = host.shared_buffer(dxr::TOP_BYTES) else { return };
+            let Some((buffer, data)) = host.shared_buffer(dxr::TOP_BYTES) else { return false };
             let got = self.dxr_read(list, top, dxr::TOP_BYTES, &buffer, 0);
             list.keep(&buffer);
             self.dxr.stats[0] += 1;
             self.dxr.pending.push(dxr::Pending { due: self.frame + dxr::LATER, what: dxr::What::Top(top), buffer, data: data as usize, got });
-            let entry = self.dxr.tops.entry(top).or_insert((0, Vec::new(), 0));
-            entry.0 = self.frame;
+            let entry = self.dxr.tops.entry(top).or_default();
+            entry.read = self.frame;
             // The bottom levels its instances named last time, their headers.
-            let wanted: Vec<u64> = entry.1.iter().copied().take(dxr::BOTTOMS).collect();
+            let mut wanted: Vec<u64> = entry.instances.iter().map(|i| i.bottom).collect();
+            wanted.sort_unstable();
+            wanted.dedup();
+            wanted.truncate(dxr::BOTTOMS);
             if !wanted.is_empty() {
-                let Some((buffer, data)) = host.shared_buffer(64 * wanted.len() as u64) else { return };
+                let Some((buffer, data)) = host.shared_buffer(64 * wanted.len() as u64) else { return false };
                 let mut got = Vec::new();
                 for (k, &b) in wanted.iter().enumerate() {
                     got.extend(self.dxr_read(list, b, 64, &buffer, 64 * k as u64));
@@ -1229,12 +1541,462 @@ impl Memory {
                 self.dxr.pending.push(dxr::Pending { due: self.frame + dxr::LATER, what: dxr::What::Bottoms(wanted), buffer, data: data as usize, got });
             }
         }
+        // The guided walk's counters, read back now and then.
+        if let Some(counters) = self.dxr.counters.clone()
+            && self.dxr.counted.0 + 60 <= self.frame
+            && !self.dxr.pending.iter().any(|p| matches!(p.what, dxr::What::Counters))
+            && let Some((buffer, data)) = host.shared_buffer(16)
+        {
+            // SAFETY: an open list; buffers it keeps.
+            unsafe {
+                list.list.ResourceBarrier(&[dxr::turn(&counters, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyBufferRegion(&buffer, 0, &counters, 0, 12);
+                list.list.ResourceBarrier(&[dxr::turn(&counters, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            }
+            list.keep(&buffer);
+            list.keep(&counters);
+            self.dxr.counted.0 = self.frame;
+            self.dxr.pending.push(dxr::Pending { due: self.frame + dxr::LATER, what: dxr::What::Counters, buffer, data: data as usize, got: vec![(0, 12)] });
+        }
+        // (Not while the live switch has the host's structures unused.)
+        if matches!(crate::live::ray_tracing(), Some(0 | 1)) {
+            return false;
+        }
+        let started = std::time::Instant::now();
+        let clobbered = self.dxr_build(list, addresses);
+        if clobbered {
+            self.dxr.period[3] += started.elapsed().as_micros() as u64;
+        }
+        clobbered
+    }
+
+    /// Host bottom levels for the instances of `tops` that want one, then
+    /// their host top levels. True if anything was recorded.
+    fn dxr_build(&mut self, list: &HostList, tops: &[u64]) -> bool {
+        if self.dxr.pass.is_none() {
+            self.dxr.pass = Some(dxr::make_pass());
+        }
+        let Some(Some(pass)) = self.dxr.pass.as_ref() else { return false };
+        let (pass_root, pass_pso, device) = (pass.root.clone(), pass.pso.clone(), pass.device.clone());
+        let Ok(list4) = windows::core::Interface::cast::<ID3D12GraphicsCommandList4>(&list.list) else { return false };
+        let frame = self.frame;
+        // Room on the card, asked once a frame.
+        if self.dxr.room.0 != frame {
+            let room = host().and_then(|h| h.video_memory()).is_none_or(|[budget, used, ..]| (used as f64) < dxr::CARD_SHARE * budget as f64);
+            self.dxr.room = (frame, room);
+            if !room {
+                self.dxr.card_full += 1;
+            }
+        }
+        let kept: u64 = self.dxr.built.values().map(|b| b.bytes).sum();
+        let room = self.dxr.room.1 && kept < dxr::MOST_KEPT;
+        // The bottom levels to build now.
+        let mut todo: Vec<(u64, [u32; 16])> = Vec::new();
+        for top in tops {
+            let Some(t) = self.dxr.tops.get(top) else { continue };
+            for i in &t.instances {
+                if todo.len() >= dxr::BUILDS {
+                    break;
+                }
+                let Some(b) = self.dxr.bottoms.get(&i.bottom) else { continue };
+                if !dxr::usable_bottom(&b.header) || todo.iter().any(|t| t.0 == i.bottom) {
+                    continue;
+                }
+                let again = match self.dxr.built.get(&i.bottom) {
+                    None => true,
+                    Some(built) => {
+                        built.header != b.header || (!dxr::static_bottom(&b.header) && built.frame + dxr::AGAIN <= frame)
+                    }
+                };
+                if again && room {
+                    todo.push((i.bottom, b.header));
+                }
+            }
+        }
+        let mut recorded = false;
+        for (bottom, header) in todo {
+            let (first, count) = (u64::from(header[13]), u64::from(header[3]));
+            let Some(host) = host() else { break };
+            let Some((elements, _)) = host.shared_buffer(64 * count) else { break };
+            let Some(vertices) = dxr::card_buffer(&device, 144 * count, D3D12_RESOURCE_STATE_COMMON) else { break };
+            // SAFETY: an open list; buffers it keeps.
+            unsafe { list.list.ResourceBarrier(&[dxr::turn(&elements, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]) };
+            let got = self.dxr_read(list, bottom + first, 64 * count, &elements, 0);
+            if got.iter().map(|g| g.1).sum::<u64>() < 64 * count {
+                // (Some of it is not in an arena: next time.)
+                self.dxr.left_out += 1;
+                // SAFETY: as above.
+                unsafe { list.list.ResourceBarrier(&[dxr::turn(&elements, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]) };
+                list.keep(&elements);
+                continue;
+            }
+            let triangles = 4 * count;
+            let geometry = D3D12_RAYTRACING_GEOMETRY_DESC {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        Transform3x4: 0,
+                        IndexFormat: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN,
+                        VertexFormat: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32_FLOAT,
+                        IndexCount: 0,
+                        VertexCount: (3 * triangles) as u32,
+                        IndexBuffer: 0,
+                        // SAFETY: a live buffer.
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE { StartAddress: unsafe { vertices.GetGPUVirtualAddress() }, StrideInBytes: 12 },
+                    },
+                },
+            };
+            let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                NumDescs: 1,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 { pGeometryDescs: &geometry },
+            };
+            let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+            // SAFETY: the inputs live through the call.
+            unsafe { device.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut sizes) };
+            let (Some(structure), Some(scratch)) = (
+                dxr::card_buffer(&device, sizes.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE),
+                dxr::card_buffer(&device, sizes.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_COMMON),
+            ) else {
+                self.dxr.left_out += 1;
+                list.keep(&elements);
+                list.keep(&vertices);
+                continue;
+            };
+            // SAFETY: an open list; every buffer is kept by it below; the
+            // pass's root signature takes two constants, a view to read and
+            // one to write.
+            unsafe {
+                let l = &list.list;
+                l.ResourceBarrier(&[
+                    dxr::turn(&elements, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    dxr::turn(&vertices, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                    dxr::turn(&scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                ]);
+                l.SetComputeRootSignature(&pass_root);
+                l.SetPipelineState(&pass_pso);
+                l.SetComputeRoot32BitConstants(0, 2, [0u32, count as u32].as_ptr().cast(), 0);
+                l.SetComputeRootShaderResourceView(1, elements.GetGPUVirtualAddress());
+                l.SetComputeRootUnorderedAccessView(2, vertices.GetGPUVirtualAddress());
+                l.Dispatch(count.div_ceil(64) as u32, 1, 1);
+                l.ResourceBarrier(&[dxr::turn(&vertices, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+                let build = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                    DestAccelerationStructureData: structure.GetGPUVirtualAddress(),
+                    Inputs: inputs,
+                    SourceAccelerationStructureData: 0,
+                    ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(),
+                };
+                list4.BuildRaytracingAccelerationStructure(&build, None);
+                l.ResourceBarrier(&[
+                    dxr::uav(&structure),
+                    dxr::turn(&elements, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    dxr::turn(&vertices, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON),
+                    dxr::turn(&scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+                ]);
+            }
+            for r in [&elements, &vertices, &scratch, &structure] {
+                list.keep(r);
+            }
+            recorded = true;
+            self.dxr.period[0] += 1;
+            self.dxr.period[1] += triangles;
+            self.dxr.period[4] = self.dxr.period[4].max(sizes.ScratchDataSizeInBytes);
+            // It alone in a top level, for the guided walk at its root.
+            // SAFETY: a live structure.
+            let one = D3D12_RAYTRACING_INSTANCE_DESC {
+                Transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                _bitfield1: 0xff00_0000,
+                _bitfield2: 0,
+                AccelerationStructure: unsafe { structure.GetGPUVirtualAddress() },
+            };
+            let single = self.dxr_top_level(list, &list4, &device, &[one]);
+            if let Some(single) = &single {
+                self.dxr.unpublished.push((frame + dxr::PUBLISH_AFTER, bottom, victory_shader::emit::DXR_BOTTOM, [header[12], header[13]], single.clone()));
+            }
+            if let Some(old) = self.dxr.built.insert(bottom, dxr::Built { header, frame, structure, bytes: sizes.ResultDataMaxSizeInBytes, triangles, single }) {
+                self.dxr.retired.push((frame, old.structure));
+                if let Some(single) = old.single {
+                    self.dxr.retired.push((frame, single));
+                }
+            }
+        }
+        // The top levels, once a top is read again (their instances move).
+        for top in tops {
+            let Some(t) = self.dxr.tops.get(top) else { continue };
+            if t.instances.is_empty() || (t.built.is_some() && t.built_frame >= t.read) {
+                continue;
+            }
+            let root = t.root;
+            let mut descs: Vec<D3D12_RAYTRACING_INSTANCE_DESC> = Vec::new();
+            // The walks start a bottom level at its instance's root pointer
+            // (dword 14, a static one marked in bit 30), not its header's:
+            // published under that one too.
+            let mut roots: Vec<(u64, u32, u32, ID3D12Resource)> = Vec::new();
+            for i in &t.instances {
+                let Some(built) = self.dxr.built.get(&i.bottom) else { continue };
+                if let Some(single) = &built.single {
+                    roots.push((i.bottom, i.root_pointer, built.header[13], single.clone()));
+                }
+                let mut m = [0f32; 12];
+                for (to, w) in m.iter_mut().zip(&i.words[..12]) {
+                    *to = f32::from_bits(*w);
+                }
+                let Some(n) = dxr::invert(&m) else { continue };
+                descs.push(D3D12_RAYTRACING_INSTANCE_DESC {
+                    Transform: n,
+                    _bitfield1: (i.record & 0x00ff_ffff) | (i.words[12] & 0xff00_0000),
+                    _bitfield2: 0,
+                    // SAFETY: a live structure.
+                    AccelerationStructure: unsafe { built.structure.GetGPUVirtualAddress() },
+                });
+            }
+            if descs.is_empty() {
+                continue;
+            }
+            for (bottom, pointer, offset, single) in roots {
+                let fresh = self.dxr.instance_roots.get(&(bottom, pointer)).is_none_or(|s| s != &single);
+                if fresh && pointer != 0 {
+                    self.dxr.instance_roots.insert((bottom, pointer), single.clone());
+                    self.dxr.unpublished.push((frame + dxr::PUBLISH_AFTER, bottom, victory_shader::emit::DXR_BOTTOM, [pointer, offset], single));
+                }
+            }
+            let Some(structure) = self.dxr_top_level(list, &list4, &device, &descs) else { continue };
+            recorded = true;
+            self.dxr.period[2] += 1;
+            self.dxr.unpublished.push((frame + dxr::PUBLISH_AFTER, *top, victory_shader::emit::DXR_TOP, root, structure.clone()));
+            if let Some(t) = self.dxr.tops.get_mut(top) {
+                if let Some((old, _)) = t.built.replace((structure, descs.len())) {
+                    self.dxr.retired.push((frame, old));
+                }
+                t.built_frame = frame;
+            }
+        }
+        recorded
+    }
+
+    /// A host top level of `descs`, recorded on `list`.
+    fn dxr_top_level(
+        &self,
+        list: &HostList,
+        list4: &ID3D12GraphicsCommandList4,
+        device: &ID3D12Device5,
+        descs: &[D3D12_RAYTRACING_INSTANCE_DESC],
+    ) -> Option<ID3D12Resource> {
+        let host = host()?;
+        let size = size_of_val(descs) as u64;
+        let (instances, data) = host.shared_buffer(size)?;
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(descs.as_ptr().cast::<u8>(), data, size as usize) };
+        list.keep(&instances);
+        let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+            NumDescs: descs.len() as u32,
+            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+            // SAFETY: a live buffer.
+            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 { InstanceDescs: unsafe { instances.GetGPUVirtualAddress() } },
+        };
+        let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+        // SAFETY: the inputs live through the call.
+        unsafe { device.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut sizes) };
+        let structure = dxr::card_buffer(device, sizes.ResultDataMaxSizeInBytes, D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE)?;
+        let scratch = dxr::card_buffer(device, sizes.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_COMMON)?;
+        // SAFETY: an open list; buffers it keeps.
+        unsafe {
+            list.list.ResourceBarrier(&[dxr::turn(&scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            let build = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: structure.GetGPUVirtualAddress(),
+                Inputs: inputs,
+                SourceAccelerationStructureData: 0,
+                ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(),
+            };
+            list4.BuildRaytracingAccelerationStructure(&build, None);
+            list.list.ResourceBarrier(&[dxr::uav(&structure), dxr::turn(&scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)]);
+        }
+        list.keep(&scratch);
+        list.keep(&structure);
+        Some(structure)
+    }
+
+    /// The guided walk's table entry of the structure at `address` (its
+    /// `kind`, root node pointer and list or element offset), and its view's
+    /// structure (`victory_shader::emit::MEMORY_RUN`).
+    fn dxr_publish(&mut self, address: u64, kind: u32, root: [u32; 2], structure: &ID3D12Resource) {
+        use victory_shader::emit::{DXR_ENTRIES, DXR_HASH, DXR_STRUCTURES};
+        if !self.dxr_table() {
+            return;
+        }
+        let number = match self.dxr.numbers.get(&address) {
+            Some(&n) => n,
+            None => {
+                let n = self.dxr.numbers.len() as u32;
+                if n >= DXR_STRUCTURES {
+                    return;
+                }
+                self.dxr.numbers.insert(address, n);
+                n
+            }
+        };
+        self.dxr.generation += 1;
+        if let Some((old, _)) = self.dxr.structures[number as usize].replace((structure.clone(), self.dxr.generation)) {
+            self.dxr.retired.push((self.frame, old));
+        }
+        // The root's absolute node pointer (the title's walks use the 64-bit
+        // node test with a descriptor base of 0): the key and its high dword.
+        let absolute = (address >> 3) + u64::from(root[0]);
+        let (key, key_high) = (absolute as u32, (absolute >> 32) as u32);
+        if key == 0 {
+            return;
+        }
+        let Some((_, data)) = self.dxr.table else { return };
+        let table = data as *mut u32;
+        let hash = key.wrapping_mul(DXR_HASH) >> 22;
+        for n in 0..4 {
+            let place = (hash + n) & (DXR_ENTRIES - 1);
+            // SAFETY: inside the table's mapping; the card reads it as it
+            // is written (an entry's key last: it is whole once found).
+            unsafe {
+                let entry = table.add(4 * place as usize);
+                let there = entry.read_volatile();
+                if there != 0 && there != key {
+                    continue;
+                }
+                entry.add(1).write_volatile(kind << 30 | number);
+                entry.add(2).write_volatile(key_high);
+                entry.add(3).write_volatile(root[1]);
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                entry.write_volatile(key);
+            }
+            return;
+        }
+    }
+
+    /// The table entry of the structure at `address` with root `root` emptied
+    /// (its key 0): the walk goes the title's way there again.
+    fn dxr_unpublish(&mut self, address: u64, root: [u32; 2]) {
+        use victory_shader::emit::{DXR_ENTRIES, DXR_HASH};
+        let absolute = (address >> 3) + u64::from(root[0]);
+        let key = absolute as u32;
+        let Some((_, data)) = self.dxr.table else { return };
+        if key == 0 {
+            return;
+        }
+        let table = data as *mut u32;
+        let hash = key.wrapping_mul(DXR_HASH) >> 22;
+        for n in 0..4 {
+            let place = (hash + n) & (DXR_ENTRIES - 1);
+            // SAFETY: inside the table's mapping.
+            unsafe {
+                let entry = table.add(4 * place as usize);
+                if entry.read_volatile() == key {
+                    entry.write_volatile(0);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The guided walk's table made, if it is not yet: [`DXR_ENTRIES`] entries
+    /// and after them the live switch's dword (`crate::live::ray_tracing`).
+    ///
+    /// [`DXR_ENTRIES`]: victory_shader::emit::DXR_ENTRIES
+    fn dxr_table(&mut self) -> bool {
+        use victory_shader::emit::{DXR_ENTRIES, DXR_STRUCTURES};
+        if self.dxr.table.is_some() {
+            return true;
+        }
+        let bytes = DXR_ENTRIES as usize * 16 + 16;
+        let Some((buffer, data)) = host().and_then(|h| h.shared_buffer(bytes as u64)) else { return false };
+        // SAFETY: the new mapping, zeroed: every entry empty, the switch 0.
+        unsafe { std::ptr::write_bytes(data, 0, bytes) };
+        self.dxr.table = Some((buffer, data as usize));
+        self.dxr.structures = vec![None; DXR_STRUCTURES as usize];
+        self.dxr.counters = host()
+            .and_then(|h| windows::core::Interface::cast::<ID3D12Device5>(&h.device).ok())
+            .and_then(|device| dxr::card_buffer(&device, 256, D3D12_RESOURCE_STATE_COMMON));
+        true
+    }
+
+    /// The live switch into the table's last dword: 0 as translated (the
+    /// host's structures guide), 1 the title's walk only, 2 off.
+    fn dxr_switch(&mut self) {
+        let word = match crate::live::ray_tracing() {
+            Some(0) => 2,
+            Some(1) => 1,
+            _ => 0,
+        };
+        if let Some((_, data)) = self.dxr.table {
+            // SAFETY: the table's mapping has the switch's dword after its
+            // entries.
+            unsafe { (data as *mut u32).add(victory_shader::emit::DXR_ENTRIES as usize * 4).write_volatile(word) };
+        }
+    }
+
+    /// The table's view and the structures' views in heap `heap`'s run from
+    /// `base` (`victory_shader::emit::MEMORY_RUN`), those set since it was
+    /// last written.
+    fn dxr_views(&mut self, heap: &HostHeap, base: u32) {
+        // (Made before any structure: the switch works from the start.)
+        if !self.dxr_table() {
+            return;
+        }
+        let Some((table, _)) = self.dxr.table.as_ref() else { return };
+        let key = std::ptr::from_ref(heap) as usize;
+        let seen = self.dxr.views.get(&key).copied();
+        if seen == Some(self.dxr.generation) {
+            return;
+        }
+        let run = victory_shader::emit::MEMORY_RUN;
+        if seen.is_none() {
+            heap.raw_uav_at(base + run, table, 0, u64::from(victory_shader::emit::DXR_ENTRIES) * 16 + 16);
+            if let Some(counters) = &self.dxr.counters {
+                heap.raw_uav_at(base + run + 1 + victory_shader::emit::DXR_STRUCTURES, counters, 0, 256);
+            }
+        }
+        for (n, s) in self.dxr.structures.iter().enumerate() {
+            if let Some((structure, set)) = s
+                && seen.is_none_or(|seen| *set > seen)
+            {
+                heap.accel_srv_at(base + run + 1 + n as u32, structure);
+            }
+        }
+        self.dxr.views.insert(key, self.dxr.generation);
     }
 
     /// Once a frame: reads that came are looked at; a line every ten
     /// seconds.
     fn dxr_frame(&mut self) {
         let frame = self.frame;
+        self.dxr_switch();
+        // Structures whose builds are done by now: published.
+        let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dxr.unpublished).into_iter().partition(|u| u.0 <= frame);
+        self.dxr.unpublished = later;
+        for (at, address, kind, root, structure) in due {
+            self.dxr_publish(address, kind, root, &structure);
+            if kind == victory_shader::emit::DXR_TOP {
+                self.dxr.top_built.insert(address, (at.saturating_sub(dxr::PUBLISH_AFTER), root));
+            }
+        }
+        if matches!(crate::live::ray_tracing(), None | Some(2)) {
+            let stale: Vec<(u64, [u32; 2])> = self
+                .dxr
+                .top_built
+                .iter()
+                .filter(|(_, (built, _))| built + dxr::STALE_TOP < frame)
+                .map(|(&a, &(_, root))| (a, root))
+                .collect();
+            for (address, root) in stale {
+                self.dxr_unpublish(address, root);
+                self.dxr.top_built.remove(&address);
+            }
+        }
+        // (A bottom level let go at `at` may be named by any top level built
+        // at or before it: kept until every published one is newer.)
+        let oldest_top = self.dxr.top_built.values().map(|&(b, _)| b).min().unwrap_or(u64::MAX);
+        self.dxr.retired.retain(|(at, _)| at + dxr::KEEP_AFTER > frame || oldest_top <= *at);
         let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dxr.pending).into_iter().partition(|p| p.due <= frame);
         self.dxr.pending = waiting;
         for p in ready {
@@ -1246,22 +2008,41 @@ impl Memory {
                         // Not a top level (another view the program is
                         // given): not read again.
                         if let (Some(t), Some(_)) = (self.dxr.tops.get_mut(top), &header) {
-                            t.0 = u64::MAX / 2;
+                            t.read = u64::MAX / 2;
                         }
                         continue;
                     };
                     let (first, count) = (u64::from(h[13]), h[3]);
-                    let mut bottoms: Vec<u64> = (0..u64::from(count))
-                        .filter(|k| first + 128 * k + 64 <= dxr::TOP_BYTES)
-                        .filter_map(|k| p.word((first + 128 * k) / 4 + 15).map(|w| u64::from(w) << 8))
-                        .filter(|&b| b != 0)
-                        .collect();
-                    bottoms.sort_unstable();
-                    bottoms.dedup();
+                    let mut instances = Vec::new();
+                    for k in 0..u64::from(count) {
+                        let at = first + 128 * k;
+                        if at + 64 > dxr::TOP_BYTES {
+                            break;
+                        }
+                        let words: Option<Vec<u32>> = (0..16).map(|n| p.word(at / 4 + n)).collect();
+                        let Some(w) = words else { continue };
+                        // (Records past the live ones hold the largest float.)
+                        if w[15] == 0 || w[14] == 0x7f7f_ffff {
+                            continue;
+                        }
+                        let mut words = [0u32; 14];
+                        words.copy_from_slice(&w[..14]);
+                        instances.push(dxr::Instance { words, bottom: u64::from(w[15]) << 8, record: k as u32, root_pointer: w[14] });
+                    }
                     self.dxr.stats[1] += 1;
                     if let Some(t) = self.dxr.tops.get_mut(top) {
-                        t.1 = bottoms;
-                        t.2 = count;
+                        t.instances = instances;
+                        t.count = count;
+                        t.root = [h[12], h[13]];
+                    }
+                }
+                dxr::What::Counters => {
+                    let now: Option<Vec<u32>> = (0..3).map(|n| p.word(n)).collect();
+                    if let Some(now) = now {
+                        for k in 0..3 {
+                            self.dxr.counted_period[k] += u64::from(now[k].wrapping_sub(self.dxr.counted.1[k]));
+                            self.dxr.counted.1[k] = now[k];
+                        }
                     }
                 }
                 dxr::What::Bottoms(list) => {
@@ -1280,39 +2061,68 @@ impl Memory {
             }
         }
         let now = std::time::Instant::now();
-        if self.dxr.reported.is_some_and(|r| now.duration_since(r).as_secs() < 10) {
+        let since = self.dxr.reported.map(|r| now.duration_since(r));
+        if since.is_some_and(|s| s.as_secs() < 10) {
             return;
         }
         self.dxr.reported = Some(now);
         let mut line = String::new();
-        for (top, (seen, bottoms, count)) in &self.dxr.tops {
-            if *seen + 120 < frame || *count == 0 {
+        for (top, t) in &self.dxr.tops {
+            if t.read + 120 < frame || t.count == 0 {
                 continue;
             }
-            let (mut usable, mut statics, mut elements, mut unknown) = (0, 0, 0u64, 0);
-            for b in bottoms {
+            let mut bottoms: Vec<u64> = t.instances.iter().map(|i| i.bottom).collect();
+            bottoms.sort_unstable();
+            bottoms.dedup();
+            let (mut usable, mut statics, mut elements, mut unknown, mut built) = (0, 0, 0u64, 0, 0);
+            for b in &bottoms {
                 match self.dxr.bottoms.get(b) {
                     Some(x) if dxr::usable_bottom(&x.header) => {
                         usable += 1;
                         elements += u64::from(x.header[3]);
-                        statics += usize::from(x.header[0] >> 16 & 2 != 0);
+                        statics += usize::from(dxr::static_bottom(&x.header));
+                        built += usize::from(self.dxr.built.contains_key(b));
                     }
                     Some(_) => {}
                     None => unknown += 1,
                 }
             }
+            let placed = t.built.as_ref().map_or(0, |b| b.1);
             line += &format!(
-                "; top {top:#x}: {count} instances, {} bottom levels ({usable} usable, {statics} of them rehydrated, {unknown} not read yet), {elements} elements (at most {} triangles)",
+                "; top {top:#x}: {} instances ({placed} in its host top level), {} bottom levels ({usable} usable, {statics} of them static, {built} built; {unknown} not read yet), {elements} elements",
+                t.count,
                 bottoms.len(),
-                elements * 4
             );
         }
+        let (bytes, triangles) = self.dxr.built.values().fold((0u64, 0u64), |a, b| (a.0 + b.bytes, a.1 + b.triangles));
+        let [made, made_triangles, tops, us, scratch] = std::mem::take(&mut self.dxr.period);
+        let [queries, hits, top_queries] = std::mem::take(&mut self.dxr.counted_period);
+        let secs = since.map_or(10.0, |s| s.as_secs_f64().max(1.0));
+        let switch = match crate::live::ray_tracing() {
+            Some(0) => "off",
+            Some(1) => "the title's walk only",
+            _ => "as started",
+        };
         tracing::info!(
-            "native ray tracing (VICTORY_DXR=1, reading only): {} top levels read, {} looked at, {} bottom-level headers read, {} not there{line}",
+            "native ray tracing, the guided walk (VICTORY_DXR_GUIDED=1; live switch: {switch}): {:.0} ray queries a second ({:.0} at top levels, {:.0} at bottom levels), {:.1}% of them hit",
+            queries as f64 / secs,
+            top_queries as f64 / secs,
+            queries.saturating_sub(top_queries) as f64 / secs,
+            if queries > 0 { 100.0 * hits as f64 / queries as f64 } else { 0.0 },
+        );
+        tracing::info!(
+            "native ray tracing (VICTORY_DXR=1, building, nothing traced yet): {} host bottom levels kept ({} triangles at most, {} MB of {} allowed), {} left out (not all in title memory on the card), {} frames without building for the card's memory (over {}% of its budget); since the last line {made} bottom levels built ({made_triangles} triangles), {tops} top levels, {:.1} ms recording them, the most scratch {} MB; {} top levels read, {} bottom-level headers{line}",
+            self.dxr.built.len(),
+            triangles,
+            bytes >> 20,
+            dxr::MOST_KEPT >> 20,
+            self.dxr.left_out,
+            self.dxr.card_full,
+            (dxr::CARD_SHARE * 100.0) as u32,
+            us as f64 / 1000.0,
+            scratch >> 20,
             self.dxr.stats[0],
-            self.dxr.stats[1],
             self.dxr.stats[2],
-            self.dxr.stats[3]
         );
     }
 }

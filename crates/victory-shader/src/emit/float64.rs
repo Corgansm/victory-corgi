@@ -301,6 +301,104 @@ impl Lower<'_> {
         self.s.m.select(c, is_under, under_res, r)
     }
 
+    /// `a * b + c` of three floats rounded once to a float, as the console's FMA
+    /// (`VICTORY_CASCADE_EXACT`, [`super::lower::with_cascade_exact`]), in 32-bit floats only
+    /// (the host's doubles run at 1/64 rate on GeForce cards: in doubles the title's lighting
+    /// passes ran past the driver's timeout, run 20261126-193328, event 153). The product is
+    /// made exact as two floats (Veltkamp's split by 4097, Dekker's product), the sum of the
+    /// three parts is taken as Boldo and Melquiond's emulated FMA does: `c` and the high part
+    /// two-summed, the low parts added rounded to odd (rounded to nearest, then one step
+    /// toward the exact sum where it was inexact and the last bit even), and the two added
+    /// rounded to nearest even: one rounding of the exact `a * b + c`. DXIL float operations
+    /// carry no fast-math flags, so the host keeps the order. The split overflows and the
+    /// product's error underflows at the ends of the float range: there, and for infinities,
+    /// NaN and denormal factors, the plain `FMad` is used (on the CPU the two agree with a
+    /// fused multiply-add on every one of 42 million inputs inside the range).
+    pub(super) fn fma_exact(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let add = |l: &mut Self, x: V, y: V| l.s.m.bin(cur, Bin::Add, x, y);
+        let sub = |l: &mut Self, x: V, y: V| l.s.m.bin(cur, Bin::Sub, x, y);
+        let mul = |l: &mut Self, x: V, y: V| l.s.m.bin(cur, Bin::Mul, x, y);
+        let split = |l: &mut Self, x: V| {
+            let k = l.s.m.f32(4097.0f32.to_bits());
+            let t = mul(l, k, x);
+            let d = sub(l, t, x);
+            let hi = sub(l, t, d);
+            let lo = sub(l, x, hi);
+            (hi, lo)
+        };
+        let two_sum = |l: &mut Self, x: V, y: V| {
+            let s = add(l, x, y);
+            let bv = sub(l, s, x);
+            let av = sub(l, s, bv);
+            let ea = sub(l, x, av);
+            let eb = sub(l, y, bv);
+            let e = add(l, ea, eb);
+            (s, e)
+        };
+        // the exact product p + e
+        let p = mul(self, a, b);
+        let (ah, al) = split(self, a);
+        let (bh, bl) = split(self, b);
+        let hh = mul(self, ah, bh);
+        let e = sub(self, hh, p);
+        let hl = mul(self, ah, bl);
+        let e = add(self, e, hl);
+        let lh = mul(self, al, bh);
+        let e = add(self, e, lh);
+        let ll = mul(self, al, bl);
+        let e = add(self, e, ll);
+        // c + p + e
+        let (th, tl) = two_sum(self, c, p);
+        let (x, xe) = two_sum(self, tl, e);
+        // x rounded to odd
+        let zero = self.s.m.f32(0);
+        let xe_neg = self.s.m.cmp(cur, pred::OLT, xe, zero);
+        let xe_pos = self.s.m.cmp(cur, pred::OGT, xe, zero);
+        let inexact = self.s.m.bin(cur, Bin::Or, xe_neg, xe_pos);
+        let xi = self.as_int(x);
+        let (k0, k1) = (self.s.m.i32(0), self.s.m.i32(1));
+        let low_bit = self.s.m.bin(cur, Bin::And, xi, k1);
+        let even = self.s.m.cmp(cur, pred::EQ, low_bit, k0);
+        let x_neg = self.s.m.cmp(cur, pred::SLT, xi, k0);
+        let away = self.s.m.cmp(cur, pred::EQ, x_neg, xe_neg);
+        let up = self.s.m.bin(cur, Bin::Add, xi, k1);
+        let down = self.s.m.bin(cur, Bin::Sub, xi, k1);
+        let moved = self.s.m.select(cur, away, up, down);
+        let adjust = self.s.m.bin(cur, Bin::And, inexact, even);
+        let odd = self.s.m.select(cur, adjust, moved, xi);
+        let v = self.as_float(odd);
+        let exact = add(self, th, v);
+        // inside the range where the above is exact: normal factors whose product's
+        // exponent leaves room for its error below and the split's 2^12 above
+        let exp = |l: &mut Self, f: V| {
+            let i = l.as_int(f);
+            let k23 = l.s.m.i32(23);
+            let kff = l.s.m.i32(0xFF);
+            let sh = l.s.m.bin(cur, Bin::LShr, i, k23);
+            l.s.m.bin(cur, Bin::And, sh, kff)
+        };
+        let (ea, eb, ec) = (exp(self, a), exp(self, b), exp(self, c));
+        let (k1u, k241, k251) = (self.s.m.i32(1), self.s.m.i32(241), self.s.m.i32(251));
+        let a_ok = self.s.m.cmp(cur, pred::IULE, ea, k241);
+        let a_norm = self.s.m.cmp(cur, pred::IUGE, ea, k1u);
+        let b_ok = self.s.m.cmp(cur, pred::IULE, eb, k241);
+        let b_norm = self.s.m.cmp(cur, pred::IUGE, eb, k1u);
+        let c_ok = self.s.m.cmp(cur, pred::IULE, ec, k251);
+        // product exponent ea + eb - 127 in (49, 252): ea + eb in (176, 379)
+        let sum = self.s.m.bin(cur, Bin::Add, ea, eb);
+        let (k176, k379) = (self.s.m.i32(176), self.s.m.i32(379));
+        let p_lo = self.s.m.cmp(cur, pred::IUGT, sum, k176);
+        let p_hi = self.s.m.cmp(cur, pred::IULT, sum, k379);
+        let mut ok = self.s.m.bin(cur, Bin::And, a_ok, a_norm);
+        for t in [b_ok, b_norm, c_ok, p_lo, p_hi] {
+            ok = self.s.m.bin(cur, Bin::And, ok, t);
+        }
+        // a zero factor is exact either way: the plain operation's
+        let plain = self.s.op(cur, "tertiary.f32", Attr::ReadNone, self.s.t.f32, 46, &[a, b, c]);
+        self.s.m.select(cur, ok, exact, plain)
+    }
+
     /// A 64-bit float result into its VGPR pair.
     fn write_f64(&mut self, inst: &Inst, d: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {

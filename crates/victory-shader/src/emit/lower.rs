@@ -421,6 +421,9 @@ struct Lower<'a> {
     traces: bool,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Loop headers' bodies (IR blocks, the header included), for the limit checked
+    /// at the loops' own exits ([`loop_exits`]).
+    bodies: HashMap<usize, HashSet<usize>>,
     /// The paired form ([`with_paired_lanes`]): what the lowering keeps per lane for the other
     /// console lane of this thread, and whether the lane being lowered is the upper one (its
     /// console lane the host lane plus 32).
@@ -466,6 +469,22 @@ struct LaneState {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// `VICTORY_LOOP_EXITS` (on unless `0`): in console wave64 compute programs, the
+/// iteration limit is checked at a loop's own exits. A lane whose loop reaches [`LOOP_LIMIT`] takes the next exit of that loop
+/// it meets, the way the lanes that finished leave, instead of being stopped at the back
+/// edge: there it went out by another way than the rest of its wave (a latch that only
+/// loops back sent it out of the program), and the code after the loop that counts the
+/// wave's lanes (a ballot, a wave sum, an append to a list) missed it. The title's water
+/// tile list is made that way: its 64-lane groups run as two 32-lane halves on NVIDIA
+/// cards, lanes stopped at the latch dropped out of the count, and the list skipped tiles
+/// or kept stale ones (the dark slabs on the water). The back edge still stops a lane
+/// that meets no exit in twice the limit. `0` brings the latch check back. Part of the
+/// translation's key (`victory-gpu` `shader_cache`).
+pub(crate) fn loop_exits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_EXITS").is_none_or(|v| v != "0"))
+}
 
 /// Iterations after which a loop of a program that tests rays against tree
 /// nodes is left, unless [`super::loop_limit`] names a limit for all.
@@ -880,6 +899,24 @@ thread_local! {
     static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_trace`].
     static TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_cascade_exact`].
+    static CASCADE_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the console's fused multiply-adds made exact
+/// (`VICTORY_CASCADE_EXACT`, the host picks the shaders): `v_fma_f32`, `v_fmac_f32`,
+/// `v_fmaak_f32` and `v_fmamk_f32` round once, as the console's FMA does, where DXIL's
+/// `FMad` lets the driver choose between one rounding and two. Made in 32-bit floats
+/// ([`Lower::fma_exact`]: an exact product as two floats, two-sums, a sum rounded to
+/// odd), about forty host operations each. Long chains of these decide which cascade,
+/// tile or march step a value falls in (shadow cascades, the reflection march's steps)
+/// by the last bit; with the driver's choice the host's chain drifts from the console's
+/// and the choice flips at the edges. Only the shaders named are translated so.
+pub fn with_cascade_exact<R>(f: impl FnOnce() -> R) -> R {
+    let was = CASCADE_EXACT.replace(true);
+    let r = f();
+    CASCADE_EXACT.set(was);
+    r
 }
 
 /// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form:
@@ -1698,6 +1735,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
             abort: None,
+            bodies: HashMap::new(),
             twin: paired.then(Box::default),
             upper: false,
             lds_last: None,
@@ -2464,6 +2502,20 @@ impl<'a> Lower<'a> {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                // the natural loop: what reaches a back edge's source without passing b
+                let mut body: HashSet<usize> = HashSet::from([b]);
+                let mut work: Vec<usize> = p.blocks[b]
+                    .preds
+                    .iter()
+                    .copied()
+                    .filter(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q])
+                    .collect();
+                while let Some(q) = work.pop() {
+                    if body.insert(q) {
+                        work.extend(p.blocks[q].preds.iter().copied().filter(|&r| self.block[r].is_some()));
+                    }
+                }
+                self.bodies.insert(b, body);
             }
         }
         self.cur = self.s.entry;
@@ -3919,6 +3971,9 @@ impl<'a> Lower<'a> {
     }
 
     fn fmad(&mut self, a: V, b: V, c: V) -> V {
+        if CASCADE_EXACT.get() {
+            return self.fma_exact(a, b, c);
+        }
         self.s.op(
             self.cur,
             "tertiary.f32",
@@ -12997,7 +13052,9 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
+                // with the limit at the loop's exits, this back edge only stops a lane
+                // that met none of them in the iterations after it ([`loop_exits`])
+                let ok = self.count_iteration_past(t, pred::IULT, self.loop_exits_here() && self.exits_elsewhere(t, b));
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -13044,12 +13101,33 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
+                // A latch whose other way leaves the loop stops a lane at the limit there,
+                // through that exit; one whose other way stays in the loop leaves it to the
+                // loop's own exits, and stops only a lane that met none of them
+                // ([`loop_exits`]).
                 let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
+                    let past = self.loop_exits_here() && self.loop_has(taken, not_taken) && self.exits_elsewhere(taken, b);
+                    let ok = self.count_iteration_past(taken, pred::IULT, past);
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
+                    let past = self.loop_exits_here() && self.loop_has(not_taken, taken) && self.exits_elsewhere(not_taken, b);
+                    let stop = self.count_iteration_past(not_taken, pred::IUGE, past);
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                } else if self.loop_exits_here() {
+                    // An exit of loops this block is in: a lane at a loop's limit takes it,
+                    // so it leaves the loop by the same way as the lanes that finished.
+                    let (out_t, out_f) = (self.exited(b, taken), self.exited(b, not_taken));
+                    match (out_t.is_empty(), out_f.is_empty()) {
+                        (false, true) => {
+                            let over = self.at_limit(&out_t, true);
+                            self.s.m.bin(self.cur, Bin::Or, cond, over)
+                        }
+                        (true, false) => {
+                            let under = self.at_limit(&out_f, false);
+                            self.s.m.bin(self.cur, Bin::And, cond, under)
+                        }
+                        _ => cond,
+                    }
                 } else {
                     cond
                 };
@@ -13098,6 +13176,14 @@ impl<'a> Lower<'a> {
     /// critical-edge block): the count goes up; the result compares it with
     /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
     fn count_iteration(&mut self, to: usize, p: u8) -> V {
+        self.count_iteration_past(to, p, false)
+    }
+
+    /// [`Self::count_iteration`]; with `past`, against twice the limit: the loop's
+    /// exits stop a lane at the limit ([`loop_exits`]), the back edge only one that
+    /// met none of them in as many iterations again (it leaves the program, as
+    /// before).
+    fn count_iteration_past(&mut self, to: usize, p: u8, past: bool) -> V {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
@@ -13122,6 +13208,7 @@ impl<'a> Lower<'a> {
             LOOP_LIMIT => 1 << 12,
             named => named,
         };
+        let limit = if past { limit.saturating_mul(2) } else { limit };
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
@@ -13131,6 +13218,74 @@ impl<'a> Lower<'a> {
         let over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
         over
+    }
+
+    /// The iteration limit of the loop at `header` as [`Self::count_iteration`] picks it.
+    fn limit_of(&self) -> u32 {
+        match super::loop_limit() {
+            LOOP_LIMIT if self.s.pixel => 1 << 7,
+            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
+            LOOP_LIMIT => 1 << 12,
+            named => named,
+        }
+    }
+
+    /// Whether [`loop_exits`] applies here: console wave64 compute programs, whose waves
+    /// the host may split in two and whose code after a loop counts the wave's lanes.
+    fn loop_exits_here(&self) -> bool {
+        loop_exits() && self.x.native.wave64 && matches!(self.x.native.io, StageIo::Cs(_))
+    }
+
+    /// Whether IR block `b` is in the loop at `header`.
+    fn loop_has(&self, header: usize, b: usize) -> bool {
+        self.bodies.get(&header).is_some_and(|body| body.contains(&b))
+    }
+
+    /// The loops (headers) that the edge from `b` to `to` leaves: those `b` is in and
+    /// `to` is not.
+    fn exited(&self, b: usize, to: usize) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .bodies
+            .iter()
+            .filter(|(_, body)| body.contains(&b) && !body.contains(&to))
+            .map(|(&h, _)| h)
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Whether the loop at `header` has an exit other than at latch `latch`: an edge
+    /// from a block of it to a block outside it.
+    fn exits_elsewhere(&self, header: usize, latch: usize) -> bool {
+        let Some(body) = self.bodies.get(&header) else { return false };
+        body.iter().filter(|&&q| q != latch).any(|&q| {
+            let out = |t: usize| !body.contains(&t) && self.block[t].is_some();
+            match self.x.p.blocks[q].exit {
+                crate::ir::Exit::Jump(t) => out(t),
+                crate::ir::Exit::Branch { taken, not_taken, .. } => out(taken) || out(not_taken),
+                _ => false,
+            }
+        })
+    }
+
+    /// Whether this lane has run any of `loops` (headers) to its limit (`over`), or
+    /// none of them (`!over`), as the headers' counts say: compares made the right
+    /// way round rather than negated (no `xor` of a compare, see [`Self::exit`]).
+    fn at_limit(&mut self, loops: &[usize], over: bool) -> V {
+        let c = self.cur;
+        let limit = self.s.m.i32(self.limit_of());
+        let mut acc: Option<V> = None;
+        for &h in loops {
+            let (phi, _) = self.counters[&h];
+            let t = self.s.m.cmp(c, if over { pred::IUGE } else { pred::IULT }, phi, limit);
+            self.s.m.tag(t, Tag::Counter);
+            acc = Some(match acc {
+                None => t,
+                Some(a) => self.s.m.bin(c, if over { Bin::Or } else { Bin::And }, a, t),
+            });
+        }
+        acc.unwrap_or_else(|| self.s.m.bool(!over))
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

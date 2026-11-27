@@ -12,8 +12,10 @@
 //! A setting keeps the run's own value (its variable, read once as before)
 //! until a menu changes it: [`get`] answers `None` till then.
 //!
-//! The render scale is not put in here: victory-loader reads the same file
-//! and puts the size into the title's memory itself
+//! The render scale is the one setting for the next start: the title works
+//! its render size out once, as it starts, and makes its tile grids and
+//! render targets for it (a size changed under it while it runs breaks its
+//! pictures). victory-loader reads it from this file as the title starts
 //! (`victory_loader::hooks`), and writes `<file>.render` with the title's
 //! render, output and largest sizes, which the menus show.
 
@@ -47,10 +49,21 @@ pub(crate) const CARD_BUFFERS_MB: usize = 5;
 pub(crate) const WINDOWS_BAR_MB: usize = 6;
 pub(crate) const PANEL: usize = 7;
 pub(crate) const DXR: usize = 8;
-const COUNT: usize = 9;
+pub(crate) const RAY_TRACING: usize = 9;
+const COUNT: usize = 10;
 
 fn env_number(name: &str) -> Option<f32> {
     std::env::var(name).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite())
+}
+
+/// `name` in the file as it is before this run writes it.
+fn file_number(name: &str) -> Option<f32> {
+    let text = std::fs::read_to_string(file()?).ok()?;
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(n, _)| n.trim() == name)
+        .and_then(|(_, v)| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
 }
 
 fn env_shade(n: usize) -> f32 {
@@ -61,13 +74,17 @@ fn env_shade(n: usize) -> f32 {
 pub(crate) const SPECS: [Spec; COUNT] = [
     Spec {
         name: "VICTORY_RENDER_SCALE",
-        label: "Render scale",
-        least: 0.2,
+        label: "Render scale (next start)",
+        // (victory-loader raises a smaller one to this: at 0.2 the title
+        // crashed past its loading screen.)
+        least: 0.39,
         most: 1.0,
         step: 0.01,
         switch: false,
-        // (Made the title's own when victory-loader first says its sizes.)
-        start: || env_number("VICTORY_RENDER_SCALE").unwrap_or(2.0 / 3.0),
+        // What victory-loader started the title with: the file's, as the
+        // last run left it (made the title's own when victory-loader says
+        // the sizes).
+        start: || file_number("VICTORY_RENDER_SCALE").or_else(|| env_number("VICTORY_RENDER_SCALE")).unwrap_or(2.0 / 3.0),
     },
     Spec {
         name: "VICTORY_AMBIENT",
@@ -145,7 +162,35 @@ pub(crate) const SPECS: [Spec; COUNT] = [
         switch: true,
         start: || f32::from(u8::from(std::env::var_os("VICTORY_DXR").is_some_and(|v| v == "1"))),
     },
+    Spec {
+        name: "VICTORY_RAY_TRACING",
+        label: "Ray tracing: 2 RTX, 1 title, 0 off",
+        least: 0.0,
+        most: 2.0,
+        step: 1.0,
+        switch: false,
+        // What the run was started with (`run-highram.ps1 -Guided`, `-RT`).
+        start: || {
+            let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+            if on("VICTORY_DXR_GUIDED") {
+                2.0
+            } else if on("VICTORY_BVH_BUILDER") {
+                1.0
+            } else {
+                0.0
+            }
+        },
+    },
 ];
+
+/// The live switch of ray tracing, when a menu has moved it: 2 the host's
+/// structures guide the title's walks (as `VICTORY_DXR_GUIDED` translates
+/// them), 1 the title's own walk only, 0 off (every node missed, and the
+/// stand-in for the indirect light on, `crate::ambient`). Works in a run
+/// whose trace programs were translated with `VICTORY_DXR_GUIDED=1`.
+pub(crate) fn ray_tracing() -> Option<u32> {
+    get(RAY_TRACING).map(|v| v.round().clamp(0.0, 2.0) as u32)
+}
 
 /// Each setting's value now and the run's own, as bits.
 static NOW: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
@@ -333,7 +378,7 @@ mod overlay {
     const BAR: (i32, i32) = (200, 390);
 
     fn height() -> i32 {
-        TOP + ROW * SPECS.len() as i32 + 30
+        TOP + ROW * SPECS.len() as i32 + 50
     }
 
     pub(super) fn start() {
@@ -626,6 +671,10 @@ mod overlay {
                     format!("{v:.2}")
                 };
                 text(dc, &shown, RECT { left: BAR.1 + 10, top: y, right: w, bottom: y + ROW }, DT_LEFT);
+                if n == super::RENDER_SCALE && changed {
+                    SetTextColor(dc, COLORREF(0x0040_D0FF));
+                    text(dc, "restart the game to apply", RECT { left: 10, top: h - 48, right: w, bottom: h - 28 }, DT_LEFT);
+                }
             }
             SetTextColor(dc, COLORREF(0x0090_9090));
             text(

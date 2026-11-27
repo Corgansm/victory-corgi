@@ -7,8 +7,10 @@
 # comes from <file>.render (victory-loader). The overlay in the game (F8)
 # changes the same file; this window follows it.
 #
-#   powershell -STA -ExecutionPolicy Bypass -File live-menu.ps1 [-Settings D:\victory-data\live-settings.txt]
-param([string]$Settings = 'D:\victory-data\live-settings.txt')
+# The render scale is for the next start (the game works its render size out once, as it starts): "Restart game"
+# closes victory.exe and starts it again with -Launcher (run-highram.ps1 passes itself).
+#   powershell -STA -ExecutionPolicy Bypass -File live-menu.ps1 [-Settings D:\victory-data\live-settings.txt] [-Launcher run.ps1]
+param([string]$Settings = 'D:\victory-data\live-settings.txt', [string]$Launcher = '')
 $File = $Settings
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +54,23 @@ $status.Size = New-Object System.Drawing.Size(540, 40)
 $status.ForeColor = [System.Drawing.Color]::FromArgb(180, 180, 180)
 $status.Text = "waiting for VIctory: start a run with VICTORY_LIVE_FILE=$File"
 $form.Controls.Add($status)
+
+$restart = New-Object System.Windows.Forms.Button
+$restart.Text = 'Restart game (applies the render scale)'
+$restart.FlatStyle = 'Flat'
+$restart.ForeColor = $fore
+$restart.Size = New-Object System.Drawing.Size(320, 30)
+$restart.Location = New-Object System.Drawing.Point(10, 70)
+$restart.Enabled = [bool]$Launcher -and (Test-Path -LiteralPath $Launcher)
+$restart.Add_Click({
+    $answer = [System.Windows.Forms.MessageBox]::Show($form, 'Close the game and start it again now?', 'VIctory', 'YesNo', 'Question')
+    if ($answer -ne 'Yes') { return }
+    Get-Process victory -ErrorAction SilentlyContinue | Stop-Process -Force
+    for ($i = 0; $i -lt 40 -and (Get-Process victory -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }
+    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Launcher`""
+    $status.Text = 'restarting the game ...'
+})
+$form.Controls.Add($restart)
 
 function Format-Value($spec, [double]$v) {
     if ($spec.Switch) { if ($v -ge 0.5) { return 'on' } else { return 'off' } }
@@ -163,7 +182,8 @@ function Build-Rows {
         $script:rows[$spec.Name] = $row
         $y += 34
     }
-    $form.ClientSize = New-Object System.Drawing.Size(560, ($y + 10))
+    $restart.Location = New-Object System.Drawing.Point(10, ($y + 6))
+    $form.ClientSize = New-Object System.Drawing.Size(560, ($y + 46))
 }
 
 function Load-Values {

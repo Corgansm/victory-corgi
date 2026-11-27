@@ -201,6 +201,36 @@ impl Shader {
     }
 }
 
+/// Whether shader `hash` is translated with exact fused multiply-adds
+/// (`VICTORY_CASCADE_EXACT`): hashes as the log names them, comma separated (a
+/// prefix will do), or `1` for the shaders known to need it: the title's
+/// reflection and probe-lighting passes, whose depth march and cascade picks
+/// are suspected of the stacked slabs on the water (skipping the first removes
+/// them; whether its FMAs' rounding is the cause is what this tests).
+#[cfg(windows)]
+fn cascade_exact(hash: &str) -> bool {
+    const KNOWN: [&str; 2] = ["2fe078146e7045ff", "a53a7977fe762268"];
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let value = std::env::var("VICTORY_CASCADE_EXACT").unwrap_or_default();
+        let list: Vec<String> = match value.trim() {
+            "" | "0" => Vec::new(),
+            "1" => KNOWN.iter().map(|h| (*h).to_owned()).collect(),
+            v => v
+                .split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
+        };
+        if !list.is_empty() {
+            tracing::info!(?list, "VICTORY_CASCADE_EXACT: these shaders get exact fused multiply-adds");
+        }
+        list
+    });
+    let hash = hash.to_ascii_lowercase();
+    list.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
 #[cfg(windows)]
 fn translate(container: &[u8], hash: &str) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
@@ -211,19 +241,36 @@ fn translate(container: &[u8], hash: &str) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
+    // `VICTORY_CASCADE_EXACT`: fused multiply-adds rounded once, as the console's
+    // (`victory_shader::emit::with_cascade_exact`); not from the cache.
+    let exact = cascade_exact(hash);
+    if exact {
+        tracing::info!(hash, "shader translated with exact fused multiply-adds (VICTORY_CASCADE_EXACT)");
+    }
+    let plain = |c: &[u8]| -> Result<victory_shader::emit::HostShader, String> {
+        if exact {
+            victory_shader::emit::with_cascade_exact(|| victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+        } else {
+            crate::shader_cache::host_shader(c)
+        }
+    };
     // `VICTORY_SHADER_TRACE`: translated traced, not from the cache (`crate::debugger::trace`)
     #[cfg(feature = "diagnostics")]
     let host = if crate::debugger::trace::traced(hash) {
         tracing::info!(hash, "shader translated traced (VICTORY_SHADER_TRACE)");
-        victory_shader::emit::with_trace(|| victory_shader::emit::translate(container)).map_err(|e| e.to_string())?
+        victory_shader::emit::with_trace(|| {
+            if exact {
+                victory_shader::emit::with_cascade_exact(|| victory_shader::emit::translate(container))
+            } else {
+                victory_shader::emit::translate(container)
+            }
+        })
+        .map_err(|e| e.to_string())?
     } else {
-        crate::shader_cache::host_shader(container)?
+        plain(container)?
     };
     #[cfg(not(feature = "diagnostics"))]
-    let host = {
-        let _ = hash;
-        crate::shader_cache::host_shader(container)?
-    };
+    let host = plain(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),

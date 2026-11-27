@@ -1573,6 +1573,21 @@ impl State {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
+                // Native ray tracing recorded work of its own on the list
+                // (`crate::memory`): this draw's root signature and pipeline
+                // again, before its arguments.
+                // (Its pass set the compute root signature only.)
+                if ready.clobbered {
+                    // SAFETY: an open list, a live root signature and pipeline.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootSignature(&p.root);
+                        }
+                        l.SetPipelineState(&p.pso);
+                    }
+                    self.host_roots[1] = if compute { p.root.as_raw() as usize } else { 0 };
+                    self.host_pipeline = p.pso.as_raw() as usize;
+                }
                 Some(ready)
             } else {
                 None

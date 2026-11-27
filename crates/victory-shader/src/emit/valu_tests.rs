@@ -2652,3 +2652,70 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// Inputs where one rounding of `a * b + c` and two differ (and some where they agree):
+/// near-cancellations at many scales, and random floats in the range
+/// `VICTORY_CASCADE_EXACT` makes exact.
+fn fma_cases() -> Vec<[u32; 4]> {
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut r = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut cases = Vec::new();
+    while cases.len() < 256 {
+        let (a, b, c) = if cases.len() % 2 == 0 {
+            let k = (r() % 64) as i32 - 32;
+            let a = (1.0 + (r() % 1000) as f32 * 1e-4) * 2f32.powi(k);
+            let b = 1.0 + (r() % (1 << 23)) as f32 / (1u32 << 23) as f32;
+            let c = -(a * b) * (1.0 + ((r() % 7) as f32 - 3.0) * f32::EPSILON);
+            (a, b, c)
+        } else {
+            let s = |v: u64| f32::from_bits(((v as u32) & 0x807F_FFFF) | ((100 + (v >> 40) as u32 % 50) << 23));
+            (s(r()), s(r()), s(r()))
+        };
+        cases.push([a.to_bits(), b.to_bits(), c.to_bits(), 0]);
+    }
+    cases
+}
+
+/// `v_fma_f32` with `VICTORY_CASCADE_EXACT`: one rounding, as the console's FMA, on the
+/// card (the plain translation's `FMad` leaves the driver the choice; how often it
+/// rounds twice on this host is printed).
+#[test]
+fn v_fma_f32_with_cascade_exact_rounds_once_on_the_card() {
+    // v_fma_f32 v0, v1, v2, v3 (VOP3 opcode 0x14B)
+    let body = vop3(0x14B, 0, vgpr(1), vgpr(2), vgpr(3));
+    let cases = fma_cases();
+    let fused = |c: [u32; 4]| f32::from_bits(c[0]).mul_add(f32::from_bits(c[1]), f32::from_bits(c[2])).to_bits();
+    let differ = cases
+        .iter()
+        .filter(|c| fused(**c) != (f32::from_bits(c[0]) * f32::from_bits(c[1]) + f32::from_bits(c[2])).to_bits())
+        .count();
+    assert!(differ > 64, "too few cases where the roundings differ: {differ}");
+
+    let plain = build_valu_cs(&body);
+    let mut twice = std::collections::BTreeMap::<String, usize>::new();
+    run_cases(&plain, &cases, |backend, _, inp, got| {
+        if got != fused(inp) {
+            *twice.entry(backend.to_owned()).or_default() += 1;
+        }
+    });
+    eprintln!("plain FMad: results that differ from one rounding, of {} ({differ} where it matters): {twice:?}", cases.len());
+
+    let exact = lower::with_cascade_exact(|| build_valu_cs(&body));
+    run_cases(&exact, &cases, |backend, i, inp, got| {
+        assert_eq!(
+            got,
+            fused(inp),
+            "{backend}, case {i}: fma({:e}, {:e}, {:e}) = {:e}, want {:e}",
+            f32::from_bits(inp[0]),
+            f32::from_bits(inp[1]),
+            f32::from_bits(inp[2]),
+            f32::from_bits(got),
+            f32::from_bits(fused(inp)),
+        );
+    });
+}
