@@ -100,7 +100,10 @@ fn set() -> Set {
 /// Whether the stand-in is on: set, and the title's rays find nothing.
 pub(crate) fn on() -> bool {
     // (Or ray tracing switched off by the live menus, `crate::live`.)
-    set() != Set::Off && (!crate::pipeline::builder_runs() || crate::live::ray_tracing() == Some(0))
+    // (The layer's own structures count as the builder's: with them the rays
+    // find the world, `crate::rtas`.)
+    let traced = crate::pipeline::builder_runs() || crate::rtas::native() == crate::rtas::Native::All && crate::rtas::on();
+    set() != Set::Off && (!traced || crate::live::ray_tracing() == Some(0))
 }
 
 /// The most the air scatters, as a multiple of the light around

@@ -2916,6 +2916,26 @@ impl HostHeap {
         self.keep(index, Some(structure.clone()));
     }
 
+    /// Makes slot `index` (a dynamic one) a view of no acceleration
+    /// structure: a ray query against it misses.
+    pub(crate) fn null_accel_srv_at(&self, index: u32) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                RaytracingAccelerationStructure: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV { Location: 0 },
+            },
+        };
+        // SAFETY: a slot of our heap; a view of no structure (address 0) is
+        // allowed.
+        unsafe { host.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), self.at(index)) };
+        self.put(index);
+        self.clear_twin(index);
+        self.keep(index, None);
+    }
+
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {

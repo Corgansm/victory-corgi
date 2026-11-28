@@ -76,6 +76,8 @@ pub mod queue;
 pub mod replay;
 pub mod resource;
 pub mod root;
+// The title's calls into its ray-tracing structure builder (`VICTORY_BVH_HOOK`).
+pub mod rtas;
 #[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]

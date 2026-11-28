@@ -1087,8 +1087,15 @@ pub(crate) fn ready(
             let run = COPIES + 3 + victory_shader::emit::DXR_STRUCTURES;
             let base = heap.dynamic(run)?;
             // Every slot of the run: a number shows no view of another kind.
+            // (A structure's slot a view of no acceleration structure: a ray
+            // query against it misses.)
+            let structures = victory_shader::emit::MEMORY_RUN + 1..victory_shader::emit::MEMORY_RUN + 1 + victory_shader::emit::DXR_STRUCTURES;
             for n in 0..run {
-                heap.null_raw_uav_at(base + n);
+                if structures.contains(&n) && dxr::enter_early().is_none() {
+                    heap.null_accel_srv_at(base + n);
+                } else {
+                    heap.null_raw_uav_at(base + n);
+                }
             }
             (base, 0)
         }
@@ -1129,6 +1136,69 @@ pub(crate) fn ready(
         base,
         clobbered,
     })
+}
+
+/// A gather of the native builder's (`crate::rtas::card_native`): `count`
+/// element nodes written to title memory at `to` on the card, their
+/// vertices read from the title's vertex memory in `vertices` (its copy) by
+/// the offsets in `plan` (from title address `base`; the largest `most`).
+pub(crate) struct Gather {
+    pub(crate) to: u64,
+    pub(crate) count: u32,
+    pub(crate) plan: ID3D12Resource,
+    pub(crate) vertices: Arc<Shadow>,
+    pub(crate) base: u64,
+    pub(crate) most: u32,
+}
+
+// SAFETY: a buffer of the host's (free-threaded) and a copy shared between
+// threads as it is.
+unsafe impl Send for Gather {}
+
+/// Records `gather` on `list` at its place (`crate::list::work_here`);
+/// whether every node's bytes went to an arena's copy.
+pub(crate) fn card_elements(list: &HostList, gather: &Gather) -> bool {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    let Some(m) = guard.as_mut() else { return false };
+    let done = m.dxr_gather(list, gather);
+    m.dxr.gathered[0] += u64::from(done);
+    m.dxr.gathered[1] += if done { u64::from(gather.count) } else { 0 };
+    m.dxr.gathered[3] += u64::from(!done);
+    done
+}
+
+/// Records on `list` at its place the copy of `bytes` of title memory from
+/// `from` to `to`, both in arenas' copies on the card (a structure whose
+/// elements only the card holds, copied by the title).
+pub(crate) fn card_copy(list: &HostList, to: u64, from: u64, bytes: u64) -> bool {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(m) = guard.as_mut() else { return false };
+    let done = m.dxr_copy(list, to, from, bytes);
+    m.dxr.gathered[2] += u64::from(done);
+    m.dxr.gathered[3] += u64::from(!done);
+    done
+}
+
+/// A buffer in the PC's memory the card reads, with the CPU's mapping (the
+/// native builder's plans).
+pub(crate) fn shared_buffer(bytes: u64) -> Option<(ID3D12Resource, usize)> {
+    host().and_then(|h| h.shared_buffer(bytes)).map(|(buffer, data)| (buffer, data as usize))
+}
+
+/// Title memory the layer itself wrote for the title on the CPU (the native
+/// builder's structures, `crate::rtas`): its pages are taken as views'
+/// are, and what was written goes up to their copies.
+pub(crate) fn title_wrote(start: u64, len: u64) {
+    let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = Memory::new();
+    }
+    if let Some(m) = guard.as_mut() {
+        m.ready(start, len);
+    }
 }
 
 /// Native ray tracing (`VICTORY_DXR=1`; off by default; `DXR-PLAN.md`), its
@@ -1192,6 +1262,32 @@ mod dxr {
     /// build finished would trace memory that holds no structure yet (the
     /// card hangs: run 20261126-165057, the driver's event 153).
     pub(super) const PUBLISH_AFTER: u64 = 10;
+    /// Frames after which a view heap no list has asked the views of has no
+    /// list left recorded or running: a table entry waits for the views of
+    /// the heaps asked for since ([`Memory::dxr_enter`]). The table is read
+    /// by the card as it is written and a view is written when its heap is
+    /// next used: an entry set with its structure showed lists already
+    /// recorded or running a number whose slot held no structure yet (a new
+    /// number's, a view of nothing of another kind), and a ray query against
+    /// that is not defined. Six of the seven device losses of 2026-11-27
+    /// came 6 to 31 seconds into the world, while the first numbers were
+    /// given out, in a trace dispatch each time (DXGI_ERROR_DEVICE_HUNG).
+    pub(super) const ENTER_AFTER: u64 = 60;
+
+    /// `VICTORY_DXR_ENTER_EARLY=<frames>` (a test of the cause, off by
+    /// default): table entries set with their structures as before
+    /// [`ENTER_AFTER`], the structures' slots views of nothing of another
+    /// kind until written, and the views written only every so many frames:
+    /// the window in which a list reads a number whose slot holds no
+    /// structure, made wide.
+    pub(super) fn enter_early() -> Option<u64> {
+        static EARLY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *EARLY.get_or_init(|| {
+            let frames = std::env::var("VICTORY_DXR_ENTER_EARLY").ok()?.parse::<u64>().ok().filter(|f| *f > 0)?;
+            tracing::warn!("VICTORY_DXR_ENTER_EARLY={frames}: the guided walk's table entries are set before their views, and the views written every {frames} frames (a test: the card may hang)");
+            Some(frames)
+        })
+    }
     /// Frames a structure let go is kept: lists in flight and the host top
     /// levels made before it was replaced may still use it.
     pub(super) const KEEP_AFTER: u64 = 120;
@@ -1242,6 +1338,14 @@ mod dxr {
     #[derive(Clone, Copy)]
     pub(super) struct Instance {
         pub(super) words: [u32; 14],
+        /// Record dwords 16-27: the world-to-structure transform the walk
+        /// takes the ray into the bottom level with (dump of run
+        /// 20261127-184716, 1,034 records against the title's instance
+        /// descriptions): the translation, then the 3x3 rows, of
+        /// S * inverse(T), T the instance's own transform (dwords 0-11, object
+        /// to world, as the title gave it) and S the bottom level's node
+        /// space (`crate::rtas::Space`; none for a dynamic one).
+        pub(super) inverse: [u32; 12],
         pub(super) bottom: u64,
         /// Its number in the title's list (the host instance's id: the
         /// guided walk's instance node, `victory_shader` `bvh_guided`).
@@ -1297,6 +1401,12 @@ mod dxr {
         pub(super) stats: [u64; 4],
         /// `None` until first wanted; `Some(None)` if it cannot be made.
         pub(super) pass: Option<Option<Pass>>,
+        /// The gather pass ([`GATHER_CS`]), as `pass`.
+        pub(super) gather: Option<Option<Pass>>,
+        /// Since the last line: gathers recorded, their elements, structure
+        /// copies on the card, and those of either that could not be (no
+        /// pass, vertices outside their copy, pages not in an arena).
+        pub(super) gathered: [u64; 4],
         pub(super) built: HashMap<u64, Built>,
         /// Host bottom levels whose build is recorded and may not have run:
         /// the frame each may be used from ([`PUBLISH_AFTER`]) and its
@@ -1373,6 +1483,18 @@ mod dxr {
         pub(super) generation: u64,
         /// Per view heap: when its views were last written.
         pub(super) views: HashMap<usize, u64>,
+        /// Per view heap: the frame its views were last asked for (a list
+        /// that reads structures was recorded with it).
+        pub(super) views_asked: HashMap<usize, u64>,
+        /// Structures whose number has a new structure and whose table entry
+        /// waits for the views ([`ENTER_AFTER`]): the generation that set
+        /// it, their address, kind and root.
+        pub(super) entering: Vec<(u64, u64, u32, [u32; 2])>,
+        /// Since the last line: table entries set, the frames they waited
+        /// for their views in all, and the most one waited.
+        pub(super) entered: [u64; 3],
+        /// The frame each generation still waiting was set in.
+        pub(super) generation_frames: HashMap<u64, u64>,
         /// Structures built but not published yet: the frame they may be
         /// ([`PUBLISH_AFTER`]), their address, kind, root and offset.
         pub(super) unpublished: Vec<(u64, u64, u32, [u32; 2], ID3D12Resource, u32)>,
@@ -1460,7 +1582,8 @@ mod dxr {
 
     /// A bottom level the title made once (rehydrated): built once.
     pub(super) fn static_bottom(h: &[u32; 16]) -> bool {
-        h[0] >> 16 & 2 != 0
+        // (Or one the layer built once itself, `crate::rtas::once`.)
+        h[0] >> 16 & 2 != 0 || crate::rtas::made_once(h)
     }
 
     /// The buffers a build needs only until the card has run it (the
@@ -1623,10 +1746,41 @@ void main(uint3 id : SV_DispatchThreadID) {
         windows::core::Interface::cast(&host()?.device).ok()
     }
 
+    /// The native builder's pass for meshes whose vertices only the card
+    /// holds (`crate::rtas::card_native`): element `e`'s node from its plan
+    /// (32 bytes: the byte offsets of its four vertices from `base` in the
+    /// title's vertex memory, all ones for none, then the node's dwords 12
+    /// to 15).
+    pub(super) const GATHER_CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer C : register(b0) { uint base; uint count; };
+ByteAddressBuffer vertices : register(t0);
+ByteAddressBuffer plan : register(t1);
+RWByteAddressBuffer nodes : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint e = id.x;
+    if (e >= count) return;
+    uint4 v = plan.Load4(32u * e);
+    uint4 w = plan.Load4(32u * e + 16u);
+    [unroll] for (uint k = 0u; k < 4u; ++k) {
+        uint3 p = uint3(0x7fc00000u, 0x7fc00000u, 0x7fc00000u);
+        if (v[k] != 0xffffffffu) p = vertices.Load3(base + v[k]);
+        nodes.Store3(64u * e + 12u * k, p);
+    }
+    nodes.Store4(64u * e + 48u, w);
+}
+"#;
+
     pub(super) fn make_pass() -> Option<Pass> {
+        make_pass_of(ELEMENTS_CS)
+    }
+
+    pub(super) fn make_pass_of(source: &str) -> Option<Pass> {
         let host = host()?;
         let made = (|| -> windows::core::Result<Pass> {
-            let code = crate::host::compile(ELEMENTS_CS, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+            let code = crate::host::compile(source, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
             let device: ID3D12Device5 = windows::core::Interface::cast(&host.device)?;
             // SAFETY: the compiled bytes, with the root signature in them.
             unsafe {
@@ -1698,6 +1852,13 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
+    /// A top-level record's dwords 16-27 (translation, then the 3x3 rows) as
+    /// a 3x4 matrix of rows.
+    pub(super) fn world_to_node(w: &[u32; 12]) -> [f32; 12] {
+        let f = |k: usize| f32::from_bits(w[k]);
+        [f(3), f(4), f(5), f(0), f(6), f(7), f(8), f(1), f(9), f(10), f(11), f(2)]
+    }
+
     /// The inverse of an affine 3x4 matrix (rows), if it has one.
     pub(super) fn invert(m: &[f32; 12]) -> Option<[f32; 12]> {
         let [a, b, c, tx, d, e, f, ty, g, h, i, tz] = *m;
@@ -1755,9 +1916,12 @@ impl Memory {
             let address = at + done;
             let page = address / PAGE;
             let n = (PAGE - address % PAGE).min(len - done);
-            if let Some(place) = self.copy_of(page)
-                && self.arenas.iter().any(|a| a.0 == place)
-            {
+            // (Any copy that holds the page: a structure the title keeps
+            // inside one of its buffers is in that buffer's copy, not in an
+            // arena. Two such bottom levels had a third to a half of a
+            // scene's instances, 340 to 850, and were never read: the host's
+            // top level lacked them all, runs 20261127-191255 to -204000.)
+            if let Some(place) = self.copy_of(page) {
                 // SAFETY: an entry of the directory.
                 let start = u64::from(unsafe { self.entry(page).add(1).read() });
                 let from = &self.copies[place].buffer;
@@ -1773,6 +1937,121 @@ impl Memory {
             done += n;
         }
         got
+    }
+
+    /// Copies `len` bytes of `buffer` from `from` on into title memory at
+    /// `at`, page by page, where an arena holds it ([`Memory::dxr_read`]
+    /// the other way); the bytes that went.
+    fn dxr_write(&self, list: &HostList, at: u64, len: u64, buffer: &ID3D12Resource, from: u64) -> u64 {
+        let (mut done, mut went) = (0, 0);
+        while done < len {
+            let address = at + done;
+            let page = address / PAGE;
+            let n = (PAGE - address % PAGE).min(len - done);
+            if let Some(place) = self.copy_of(page) {
+                // SAFETY: an entry of the directory.
+                let start = u64::from(unsafe { self.entry(page).add(1).read() });
+                let to = &self.copies[place].buffer;
+                // SAFETY: an open list; live buffers; inside both.
+                unsafe {
+                    list.list.ResourceBarrier(&[dxr::turn(to, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    list.list.CopyBufferRegion(to, start + address % PAGE, buffer, from + done, n);
+                    list.list.ResourceBarrier(&[dxr::turn(to, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                went += n;
+            }
+            done += n;
+        }
+        went
+    }
+
+    /// The copies brought up to date at `list`'s submission before its own
+    /// commands (as for a list that reads them), and a mark begun for what
+    /// the layer's own work lends on it.
+    fn dxr_own_work(&mut self, list: &HostList, at: u64, len: u64) -> u32 {
+        self.ready(at, len);
+        if list.first_use(usize::MAX - (6 << 33) - self.copies.len()) {
+            self.bring_up(list);
+        }
+        self.dxr.last_token = match self.dxr.last_token.wrapping_add(1) {
+            0 => 1,
+            t => t,
+        };
+        self.dxr.token = self.dxr.last_token;
+        self.dxr.token_used = false;
+        self.dxr.take_token()
+    }
+
+    fn dxr_own_work_done(&mut self, list: &HostList) {
+        let token = std::mem::take(&mut self.dxr.token);
+        if std::mem::take(&mut self.dxr.token_used) {
+            self.dxr_mark(list, token);
+        }
+    }
+
+    /// [`card_elements`].
+    fn dxr_gather(&mut self, list: &HostList, g: &Gather) -> bool {
+        if self.dxr.gather.is_none() {
+            self.dxr.gather = Some(dxr::make_pass_of(dxr::GATHER_CS));
+        }
+        let Some(Some(pass)) = self.dxr.gather.as_ref() else { return false };
+        let (root, pso, device) = (pass.root.clone(), pass.pso.clone(), pass.device.clone());
+        let (start, len) = g.vertices.span();
+        let bytes = 64 * u64::from(g.count);
+        if g.count == 0 || g.base < start || g.base - start + u64::from(g.most) + 12 > len || g.base - start > u64::from(u32::MAX) {
+            return false;
+        }
+        let token = self.dxr_own_work(list, g.to, bytes);
+        let frame = self.frame;
+        let Some((out, _)) = self.dxr.pool.lend(&device, false, bytes, token, frame) else {
+            self.dxr_own_work_done(list);
+            return false;
+        };
+        // SAFETY: an open list; buffers it keeps below; the pass's root
+        // signature takes two constants, two views to read and one to
+        // write; the plan's offsets were checked against the copy's span.
+        unsafe {
+            let l = &list.list;
+            l.ResourceBarrier(&[dxr::uav(&g.vertices.buffer), dxr::turn(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRoot32BitConstants(0, 2, [(g.base - start) as u32, g.count].as_ptr().cast(), 0);
+            l.SetComputeRootShaderResourceView(1, g.vertices.buffer.GetGPUVirtualAddress());
+            l.SetComputeRootShaderResourceView(2, g.plan.GetGPUVirtualAddress());
+            l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
+            l.Dispatch(g.count.div_ceil(64), 1, 1);
+            l.ResourceBarrier(&[dxr::turn(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        }
+        let went = self.dxr_write(list, g.to, bytes, &out, 0);
+        // SAFETY: as above.
+        unsafe { list.list.ResourceBarrier(&[dxr::turn(&out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]) };
+        list.keep(&out);
+        list.keep(&g.plan);
+        list.keep(&g.vertices.buffer);
+        self.dxr_own_work_done(list);
+        went == bytes
+    }
+
+    /// [`card_copy`].
+    fn dxr_copy(&mut self, list: &HostList, to: u64, from: u64, bytes: u64) -> bool {
+        let Some(device) = dxr::device() else { return false };
+        let token = self.dxr_own_work(list, to, bytes);
+        let frame = self.frame;
+        let Some((between, _)) = self.dxr.pool.lend(&device, false, bytes, token, frame) else {
+            self.dxr_own_work_done(list);
+            return false;
+        };
+        // SAFETY: an open list; a buffer it keeps.
+        unsafe { list.list.ResourceBarrier(&[dxr::turn(&between, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]) };
+        let came: u64 = self.dxr_read(list, from, bytes, &between, 0).iter().map(|g| g.1).sum();
+        // SAFETY: as above.
+        unsafe { list.list.ResourceBarrier(&[dxr::turn(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]) };
+        let went = if came == bytes { self.dxr_write(list, to, bytes, &between, 0) } else { 0 };
+        // SAFETY: as above.
+        unsafe { list.list.ResourceBarrier(&[dxr::turn(&between, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]) };
+        list.keep(&between);
+        self.dxr_own_work_done(list);
+        went == bytes
     }
 
     /// Before a trace dispatch: the top levels it is given read once in a
@@ -2073,11 +2352,14 @@ impl Memory {
                 if let Some(single) = &built.single {
                     roots.push((i.bottom, i.root_pointer, built.header[13], dxr::bottom_kind(&built.header), single.clone()));
                 }
-                let mut m = [0f32; 12];
-                for (to, w) in m.iter_mut().zip(&i.words[..12]) {
-                    *to = f32::from_bits(*w);
-                }
-                let Some(n) = dxr::invert(&m) else { continue };
+                // The host's bottom level holds the title's element nodes, in
+                // the bottom level's node space: its instance goes from there
+                // to the world, the inverse of the record's world-to-node
+                // transform (dwords 16-27). (Inverting dwords 0-11, the
+                // instance's own object-to-world transform, as before, put
+                // every instance somewhere else: the host's hits were not the
+                // title's.)
+                let Some(n) = dxr::invert(&dxr::world_to_node(&i.inverse)) else { continue };
                 descs.push(D3D12_RAYTRACING_INSTANCE_DESC {
                     Transform: n,
                     _bitfield1: (i.record & 0x00ff_ffff) | (i.words[12] & 0xff00_0000),
@@ -2200,6 +2482,7 @@ impl Memory {
             let Some(gone) = self.dxr.built.remove(&address) else { continue };
             left = left.saturating_sub(bytes);
             self.dxr.unpublished.retain(|u| u.1 != address);
+            self.dxr.entering.retain(|e| e.1 != address);
             self.dxr_unpublish(address, [gone.header[12], gone.header[13]]);
             let roots: Vec<u32> = self.dxr.instance_roots.keys().filter(|k| k.0 == address).map(|k| k.1).collect();
             for pointer in roots {
@@ -2224,7 +2507,7 @@ impl Memory {
     /// `kind`, root node pointer and list or element offset), and its view's
     /// structure (`victory_shader::emit::MEMORY_RUN`).
     fn dxr_publish(&mut self, address: u64, kind: u32, root: [u32; 2], structure: &ID3D12Resource) {
-        use victory_shader::emit::{DXR_ENTRIES, DXR_HASH, DXR_HASH_SHIFT, DXR_STRUCTURES};
+        use victory_shader::emit::DXR_STRUCTURES;
         if !self.dxr_table() {
             return;
         }
@@ -2246,9 +2529,56 @@ impl Memory {
             }
         };
         self.dxr.generation += 1;
+        self.dxr.generation_frames.insert(self.dxr.generation, self.frame);
         if let Some((old, _)) = self.dxr.structures[number as usize].replace((structure.clone(), self.dxr.generation)) {
             self.dxr.retired.push((self.frame, old));
         }
+        if dxr::enter_early().is_some() {
+            self.dxr_entry(address, kind, root, number);
+            return;
+        }
+        // (The entry once the views show the structure: `dxr_enter`.)
+        self.dxr.entering.retain(|e| e.1 != address || e.3 != root);
+        self.dxr.entering.push((self.dxr.generation, address, kind, root));
+    }
+
+    /// The table entries whose structures' views are written in every heap a
+    /// list may still read them through ([`dxr::ENTER_AFTER`]): set.
+    fn dxr_enter(&mut self) {
+        let frame = self.frame;
+        self.dxr.views_asked.retain(|_, asked| *asked + dxr::ENTER_AFTER > frame);
+        let shown = self
+            .dxr
+            .views_asked
+            .keys()
+            .map(|heap| self.dxr.views.get(heap).copied().unwrap_or(0))
+            .min()
+            .unwrap_or(u64::MAX);
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.dxr.entering).into_iter().partition(|e| e.0 <= shown);
+        self.dxr.entering = later;
+        for (generation, address, kind, root) in now {
+            // (Let go meanwhile: no entry.)
+            let Some(&number) = self.dxr.numbers.get(&address) else { continue };
+            let Some(set) = self.dxr.structures.get(number as usize).and_then(|s| s.as_ref()).map(|s| s.1) else { continue };
+            // (The number's structure set again since, for another root of
+            // a bottom level's: once the views show that one.)
+            if set > shown {
+                self.dxr.entering.push((set, address, kind, root));
+                continue;
+            }
+            let waited = self.dxr.generation_frames.get(&generation).map_or(0, |at| frame.saturating_sub(*at));
+            self.dxr.entered[0] += 1;
+            self.dxr.entered[1] += waited;
+            self.dxr.entered[2] = self.dxr.entered[2].max(waited);
+            self.dxr_entry(address, kind, root, number);
+        }
+        let waiting: std::collections::HashSet<u64> = self.dxr.entering.iter().map(|e| e.0).collect();
+        self.dxr.generation_frames.retain(|g, _| waiting.contains(g));
+    }
+
+    /// The table entry of the structure at `address` with number `number`.
+    fn dxr_entry(&mut self, address: u64, kind: u32, root: [u32; 2], number: u32) {
+        use victory_shader::emit::{DXR_ENTRIES, DXR_HASH, DXR_HASH_SHIFT};
         // The root's absolute node pointer (the title's walks use the 64-bit
         // node test with a descriptor base of 0): the key and its high dword.
         let absolute = (address >> 3) + u64::from(root[0]);
@@ -2353,8 +2683,14 @@ impl Memory {
         }
         let Some((table, _)) = self.dxr.table.as_ref() else { return };
         let key = std::ptr::from_ref(heap) as usize;
+        self.dxr.views_asked.insert(key, self.frame);
         let seen = self.dxr.views.get(&key).copied();
         if seen == Some(self.dxr.generation) {
+            return;
+        }
+        if let (Some(frames), Some(_)) = (dxr::enter_early(), seen)
+            && self.frame % frames != 0
+        {
             return;
         }
         let run = victory_shader::emit::MEMORY_RUN;
@@ -2419,6 +2755,7 @@ impl Memory {
                 self.dxr.top_gone.push((frame + dxr::KEEP_AFTER, before));
             }
         }
+        self.dxr_enter();
         if matches!(crate::live::ray_tracing(), None | Some(2 | 3)) {
             let stale: Vec<(u64, [u32; 2])> = self
                 .dxr
@@ -2485,10 +2822,10 @@ impl Memory {
                     let mut instances = Vec::new();
                     for k in 0..u64::from(count) {
                         let at = first + 128 * k;
-                        if at + 64 > dxr::TOP_BYTES {
+                        if at + 128 > dxr::TOP_BYTES {
                             break;
                         }
-                        let words: Option<Vec<u32>> = (0..16).map(|n| p.word(at / 4 + n)).collect();
+                        let words: Option<Vec<u32>> = (0..28).map(|n| p.word(at / 4 + n)).collect();
                         let Some(w) = words else { continue };
                         // (Records past the live ones hold the largest float.)
                         if w[15] == 0 || w[14] == 0x7f7f_ffff {
@@ -2496,7 +2833,9 @@ impl Memory {
                         }
                         let mut words = [0u32; 14];
                         words.copy_from_slice(&w[..14]);
-                        instances.push(dxr::Instance { words, bottom: u64::from(w[15]) << 8, record: k as u32, root_pointer: w[14] });
+                        let mut inverse = [0u32; 12];
+                        inverse.copy_from_slice(&w[16..28]);
+                        instances.push(dxr::Instance { words, inverse, bottom: u64::from(w[15]) << 8, record: k as u32, root_pointer: w[14] });
                     }
                     self.dxr.stats[1] += 1;
                     if let Some(t) = self.dxr.tops.get_mut(top) {
@@ -2620,8 +2959,10 @@ impl Memory {
         }
         let (bytes, triangles) = self.dxr.built.values().fold((0u64, 0u64), |a, b| (a.0 + b.bytes, a.1 + b.triangles));
         let [no_number, no_place] = std::mem::take(&mut self.dxr.not_entered);
+        let entered = std::mem::take(&mut self.dxr.entered);
+        let gathered = std::mem::take(&mut self.dxr.gathered);
         line += &format!(
-            "; the walk's table: {} structures have a number of {} ({} given back), since the last line {no_number} not entered for want of a number and {no_place} for want of a place; {} bottom levels let go for room; waiting for the card's marks: {} reads, {} builds, {} structures to enter, {} given up",
+            "; the walk's table: {} structures have a number of {} ({} given back), since the last line {no_number} not entered for want of a number and {no_place} for want of a place; {} bottom levels let go for room; waiting for the card's marks: {} reads, {} builds, {} structures to enter, {} given up; {} table entries set once their views were written, {:.1} frames after their structures (at most {}), {} waiting; the native builder's work on the card: {} gathers ({} elements), {} structure copies, {} that could not be",
             self.dxr.numbers.len(),
             victory_shader::emit::DXR_STRUCTURES,
             self.dxr.free_numbers.len(),
@@ -2630,6 +2971,14 @@ impl Memory {
             self.dxr.building.len(),
             self.dxr.unpublished.len(),
             std::mem::take(&mut self.dxr.given_up),
+            entered[0],
+            entered[1] as f64 / entered[0].max(1) as f64,
+            entered[2],
+            self.dxr.entering.len(),
+            gathered[0],
+            gathered[1],
+            gathered[2],
+            gathered[3],
         );
         let cost = std::mem::take(&mut self.dxr.cost);
         let per = |us: u64| us as f64 / 1e3 / (self.dxr.period[0].max(1)) as f64;
@@ -2898,6 +3247,28 @@ mod tests {
     }
 
     #[test]
+    fn a_top_level_record_gives_the_host_instance_its_transform() {
+        // A record of dump 5 (dynamic bottom level, no node space): dwords
+        // 0-11 the instance's transform, 16-27 its inverse.
+        let t = [13.8575, -6.6865, 0.0, -35.1808, 6.6865, 13.8575, 0.0, -189.2898, 0.0, 0.0, 15.3864, 8.3946];
+        let inverse = dxr::invert(&t).unwrap();
+        let mut tail = [0u32; 12];
+        let [a, b, c, x, d, e, f, y, g, h, i, z] = inverse;
+        for (to, v) in tail.iter_mut().zip([x, y, z, a, b, c, d, e, f, g, h, i]) {
+            *to = v.to_bits();
+        }
+        let back = dxr::invert(&dxr::world_to_node(&tail)).unwrap();
+        for (k, (want, got)) in t.iter().zip(back).enumerate() {
+            assert!((want - got).abs() < 1e-3 * want.abs().max(1.0), "{k}: {want} {got}");
+        }
+        // The record's own numbers (rounded as the dump shows them).
+        let shown = [7.4056f32, 10.0864, -0.5456, 0.0585, 0.0282, 0.0, -0.0282, 0.0585, 0.0, 0.0, 0.0, 0.065];
+        for (k, v) in shown.iter().enumerate() {
+            assert!((f32::from_bits(tail[k]) - v).abs() < 2e-4, "{k}");
+        }
+    }
+
+    #[test]
     fn a_packed_structure_is_known_by_its_header() {
         let header = |version: u32, nodes: u32| u64::from(version) | u64::from(nodes) << 32;
         assert_eq!(packed_len(header(0x8102_0006, 0x9a1a)), Some(0x9a1b * 64));
@@ -3064,6 +3435,196 @@ pub(crate) mod capture {
                 // over): `VICTORY_MEMORY_DUMP`'s go.
                 if let Some(dump) = std::env::var_os("VICTORY_MEMORY_DUMP") {
                     let _ = std::fs::write(std::path::Path::new(&dump).join("go"), "go");
+                }
+            }
+        }
+    }
+}
+
+/// `VICTORY_BUILDER_CAPTURE=<folder>` (diagnostics): every dispatch the title
+/// asks of the console's structure builder (`XboxBvhBuilder.dll`), whether the
+/// builder runs or not (a plain start drops them all): what a native builder
+/// has to do in its place (`C:\Users\Corgan\victory-mcp\DXR-PLAN.md`, plan #2).
+///
+/// - `programs.txt`: each program once, by hash, with what it reads (its used
+///   resources: kind, root, slot, stride).
+/// - `dispatches.txt`: the first [`builder_capture::EACH`] dispatches of each
+///   program: frame, groups, whether direct or indirect, whether it ran, its
+///   root views and constants (by slot).
+/// - `frames.txt`: per frame, how many dispatches of each program.
+/// - `windows.bin` / `windows.txt` (address, offset, bytes): title memory as the
+///   CPU holds it, [`builder_capture::WINDOW`] bytes from each root view of
+///   those dispatches, and what geometry descriptions there name
+///   (`crate::records`).
+#[cfg(feature = "diagnostics")]
+pub(crate) mod builder_capture {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    /// Dispatches written of each program.
+    pub(super) const EACH: u32 = 60;
+    /// Bytes taken from each root view.
+    pub(super) const WINDOW: usize = 64 << 10;
+    /// The most bytes of windows in all.
+    const MOST: u64 = 1024 << 20;
+    /// Lines of `frames.txt`.
+    const FRAMES: u32 = 20_000;
+    /// The most bytes of one span a geometry description names.
+    const SPAN: u64 = 1 << 20;
+
+    struct Files {
+        programs: std::fs::File,
+        dispatches: std::fs::File,
+        frames: std::fs::File,
+        windows: std::fs::File,
+        index: std::fs::File,
+    }
+
+    #[derive(Default)]
+    struct State {
+        files: Option<Files>,
+        failed: bool,
+        programs: HashSet<String>,
+        counts: HashMap<String, u32>,
+        frame: u64,
+        this_frame: BTreeMap<String, u32>,
+        frame_lines: u32,
+        taken: HashSet<u64>,
+        written: u64,
+    }
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    fn folder() -> Option<&'static std::path::PathBuf> {
+        static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        FOLDER.get_or_init(|| std::env::var_os("VICTORY_BUILDER_CAPTURE").map(Into::into)).as_ref()
+    }
+
+    /// Whether this run captures.
+    pub(crate) fn on() -> bool {
+        folder().is_some()
+    }
+
+    impl State {
+        fn window(&mut self, address: u64) {
+            if !(1 << 32..1 << 40).contains(&address) || !self.taken.insert(address) || self.written >= MOST {
+                return;
+            }
+            let mut bytes = vec![0u8; WINDOW];
+            let got = crate::host::read_there(address as *const u8, &mut bytes);
+            if got == 0 {
+                return;
+            }
+            let Some(f) = self.files.as_mut() else { return };
+            let at = f.windows.metadata().map(|m| m.len()).unwrap_or(0);
+            let _ = f.windows.write_all(&bytes);
+            let _ = writeln!(f.index, "{address:#x} {at:#x} {got:#x}");
+            self.written += bytes.len() as u64;
+        }
+
+        fn close_frame(&mut self) {
+            if self.this_frame.is_empty() || self.frame_lines >= FRAMES {
+                self.this_frame.clear();
+                return;
+            }
+            self.frame_lines += 1;
+            let line = format!(
+                "frame {} {}\n",
+                self.frame,
+                self.this_frame.iter().map(|(h, n)| format!("{h}={n}")).collect::<Vec<_>>().join(" ")
+            );
+            self.this_frame.clear();
+            if let Some(f) = self.files.as_mut() {
+                let _ = f.frames.write_all(line.as_bytes());
+            }
+        }
+    }
+
+    /// A dispatch of a builder program: `views` and `constants` by root slot;
+    /// `used` what the program reads (asked once a program).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch(
+        hash: &str,
+        frame: u64,
+        groups: [u32; 3],
+        indirect: bool,
+        ran: bool,
+        views: &[(usize, u64)],
+        constants: &[(usize, Vec<u32>)],
+        used: impl FnOnce() -> Vec<victory_shader::UsedResource>,
+    ) {
+        let Some(folder) = folder() else { return };
+        let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard.get_or_insert_with(State::default);
+        if state.failed {
+            return;
+        }
+        if state.files.is_none() {
+            let _ = std::fs::create_dir_all(folder);
+            let open = |n: &str| std::fs::File::create(folder.join(n));
+            match (open("programs.txt"), open("dispatches.txt"), open("frames.txt"), open("windows.bin"), open("windows.txt")) {
+                (Ok(programs), Ok(dispatches), Ok(frames), Ok(windows), Ok(index)) => {
+                    state.files = Some(Files { programs, dispatches, frames, windows, index });
+                }
+                _ => {
+                    state.failed = true;
+                    tracing::warn!(folder = %folder.display(), "VICTORY_BUILDER_CAPTURE: its files could not be made");
+                    return;
+                }
+            }
+            tracing::info!(folder = %folder.display(), "VICTORY_BUILDER_CAPTURE: the structure builder's dispatches are written out");
+        }
+        if frame != state.frame {
+            state.close_frame();
+            state.frame = frame;
+        }
+        *state.this_frame.entry(hash.to_owned()).or_default() += 1;
+        let mut records = Vec::new();
+        if state.programs.insert(hash.to_owned()) {
+            let used = used();
+            let text: Vec<String> = used
+                .iter()
+                .map(|u| format!("{:?}/{:?}/slot{}/stride{}/reg{}", u.kind, u.root, u.slot, u.stride, u.lower_bound))
+                .collect();
+            if let Some(f) = state.files.as_mut() {
+                let _ = writeln!(f.programs, "{hash} first frame {frame} reads {}", text.join(" "));
+            }
+        }
+        let n = state.counts.entry(hash.to_owned()).or_default();
+        if *n >= EACH {
+            return;
+        }
+        *n += 1;
+        let line = format!(
+            "{hash} frame {frame} groups {}x{}x{} {} {} views {} constants {}\n",
+            groups[0],
+            groups[1],
+            groups[2],
+            if indirect { "indirect" } else { "direct" },
+            if ran { "ran" } else { "dropped" },
+            views.iter().map(|(s, v)| format!("{s}={v:#x}")).collect::<Vec<_>>().join(","),
+            constants
+                .iter()
+                .map(|(s, c)| format!("{s}=[{}]", c.iter().map(|x| format!("{x:#x}")).collect::<Vec<_>>().join(",")))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        if let Some(f) = state.files.as_mut() {
+            let _ = f.dispatches.write_all(line.as_bytes());
+        }
+        for &(_, view) in views {
+            state.window(view);
+            records.push(view);
+        }
+        // What geometry descriptions there name.
+        let mut title = |address: u64, bytes: &mut [u8]| crate::host::read_there(address as *const u8, bytes) == bytes.len();
+        for view in records {
+            for g in crate::records::read_records(view, 4096, &mut title) {
+                for (start, len) in g.spans(&mut title) {
+                    for at in (start..start + len.min(SPAN)).step_by(WINDOW) {
+                        state.window(at);
+                    }
                 }
             }
         }

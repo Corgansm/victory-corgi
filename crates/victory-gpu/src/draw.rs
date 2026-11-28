@@ -1127,6 +1127,14 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// Work of the layer's own on the host list set a compute root
+    /// signature and a pipeline (`crate::list::work_here`): the next draw
+    /// or dispatch sets its own again.
+    pub(crate) fn host_state_replaced(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -2725,6 +2733,25 @@ impl State {
         });
     }
 
+    /// `VICTORY_BUILDER_CAPTURE`: a dispatch of the structure builder, run or
+    /// dropped.
+    #[cfg(feature = "diagnostics")]
+    fn capture_builder(&self, groups: [u32; 3], indirect: bool, ran: bool) {
+        if !crate::memory::builder_capture::on() || !crate::pipeline::is_builder(self.pipeline as This) {
+            return;
+        }
+        let Some((hash, used)) = crate::pipeline::program_of(self.pipeline as This) else { return };
+        let (mut views, mut constants) = (Vec::new(), Vec::new());
+        for (slot, root) in self.compute.iter().enumerate() {
+            match root {
+                Root::View(a) => views.push((slot, *a)),
+                Root::Constants(c) => constants.push((slot, c.clone())),
+                _ => {}
+            }
+        }
+        crate::memory::builder_capture::dispatch(&hash, crate::frame::current(), groups, indirect, ran, &views, &constants, used);
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -2742,6 +2769,7 @@ impl State {
             {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots([x, y, z]);
+                self.capture_builder([x, y, z], false, false);
             }
             return;
         }
@@ -2779,6 +2807,7 @@ impl State {
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
+            self.capture_builder([x, y, z], false, true);
         }
         // Counted in threads: whole groups of them, and the program is told
         // how many of the last one run, where it asks (its `bind` set that to
@@ -3922,6 +3951,8 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            #[cfg(feature = "diagnostics")]
+            self.capture_builder([0, 0, 0], true, false);
             return false;
         }
         const DRAW: u32 = 0;
