@@ -355,14 +355,14 @@ mod tests {
 /// flat. `cargo test -p victory-gpu --lib dumped -- --ignored --nocapture`
 /// with `VICTORY_BVH_DUMP=<that folder>`.
 #[cfg(test)]
-pub(super) mod dumped {
+pub(crate) mod dumped {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
 
     const PAGE: u64 = 1 << 16;
     const ARENA: u64 = 64 << 20;
 
-    pub(super) struct Memory {
+    pub(crate) struct Memory {
         pages: HashMap<u64, (usize, u64)>,
         arenas: Vec<Vec<u8>>,
         /// Packed (static) structures the runtime saw: address, bytes.
@@ -370,13 +370,13 @@ pub(super) mod dumped {
     }
 
     impl Memory {
-        pub(super) fn dword(&self, address: u64) -> Option<u32> {
+        pub(crate) fn dword(&self, address: u64) -> Option<u32> {
             let (arena, at) = *self.pages.get(&(address / PAGE))?;
             let at = (at + address % PAGE) as usize;
             let bytes = self.arenas.get(arena)?.get(at..at + 4)?;
             Some(u32::from_le_bytes(bytes.try_into().ok()?))
         }
-        pub(super) fn words<const N: usize>(&self, address: u64) -> Option<[u32; N]> {
+        pub(crate) fn words<const N: usize>(&self, address: u64) -> Option<[u32; N]> {
             let mut w = [0u32; N];
             for (i, d) in w.iter_mut().enumerate() {
                 *d = self.dword(address + 4 * i as u64)?;
@@ -385,7 +385,7 @@ pub(super) mod dumped {
         }
     }
 
-    pub(super) fn load(folder: &std::path::Path) -> (Memory, Vec<u64>) {
+    pub(crate) fn load(folder: &std::path::Path) -> (Memory, Vec<u64>) {
         let text = std::fs::read_to_string(folder.join("pages.txt")).expect("pages.txt");
         let mut pages = HashMap::new();
         let mut walked = BTreeSet::new();

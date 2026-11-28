@@ -8,7 +8,9 @@
 # changes the same file; this window follows it.
 #
 # The render scale is for the next start (the game works its render size out once, as it starts): "Restart game"
-# closes victory.exe and starts it again with -Launcher (run-highram.ps1 passes itself).
+# closes victory.exe and starts the next run as the running one was started: the command run-highram.ps1 writes to
+# <file>.launch at each start (its switches, paths and -More). Without that file, -Launcher with no arguments (the
+# plain start).
 #   powershell -STA -ExecutionPolicy Bypass -File live-menu.ps1 [-Settings D:\victory-data\live-settings.txt] [-Launcher run.ps1]
 param([string]$Settings = 'D:\victory-data\live-settings.txt', [string]$Launcher = '')
 $File = $Settings
@@ -24,12 +26,37 @@ Add-Type -Namespace VIctory -Name Win -MemberDefinition '[DllImport("user32.dll"
 $script:shown = $false
 
 $menuPath = "$File.menu"
+$launchPath = "$File.launch"
 $renderPath = "$File.render"
 $script:rows = [ordered]@{}
 $script:loading = $false
 $script:seenFile = [datetime]::MinValue
 $script:seenMenu = [datetime]::MinValue
 $script:seenRender = [datetime]::MinValue
+$script:seenLaunch = [datetime]::MinValue
+
+# The command that starts the next run: the running one's (<file>.launch), else the launcher alone.
+function Get-Again {
+    try {
+        if (Test-Path -LiteralPath $launchPath) {
+            $text = [IO.File]::ReadAllText($launchPath).Trim()
+            if ($text.StartsWith('& ')) { return $text }
+        }
+    } catch {}
+    if ($Launcher -and (Test-Path -LiteralPath $Launcher)) { return "& '" + ($Launcher -replace "'", "''") + "'" }
+    return ''
+}
+
+# What the button says the next start is: the switches after the launcher's path.
+function Get-AgainLabel([string]$again) {
+    $rest = $again -replace "^& '(?:[^']|'')*'\s*", ''
+    # (Paths left out, the -More table named only.)
+    $rest = $rest -replace "-\w+ '(?:[^']|'')*'", '' -replace '-More @\{.*\}', '-More'
+    $rest = ($rest -replace '\s+', ' ').Trim()
+    if (-not $rest) { return 'Restart game (plain start)' }
+    if ($rest.Length -gt 40) { $rest = $rest.Substring(0, 37) + '...' }
+    return "Restart game ($rest)"
+}
 
 $back = [System.Drawing.Color]::FromArgb(16, 20, 24)
 $fore = [System.Drawing.Color]::FromArgb(230, 230, 230)
@@ -56,19 +83,25 @@ $status.Text = "waiting for VIctory: start a run with VICTORY_LIVE_FILE=$File"
 $form.Controls.Add($status)
 
 $restart = New-Object System.Windows.Forms.Button
-$restart.Text = 'Restart game (applies the render scale)'
+$restart.Text = Get-AgainLabel (Get-Again)
 $restart.FlatStyle = 'Flat'
 $restart.ForeColor = $fore
-$restart.Size = New-Object System.Drawing.Size(320, 30)
+$restart.Size = New-Object System.Drawing.Size(540, 30)
 $restart.Location = New-Object System.Drawing.Point(10, 70)
-$restart.Enabled = [bool]$Launcher -and (Test-Path -LiteralPath $Launcher)
+$restart.Enabled = [bool](Get-Again)
+$tips = New-Object System.Windows.Forms.ToolTip
+$tips.SetToolTip($restart, (Get-Again))
 $restart.Add_Click({
-    $answer = [System.Windows.Forms.MessageBox]::Show($form, 'Close the game and start it again now?', 'VIctory', 'YesNo', 'Question')
+    $again = Get-Again
+    if (-not $again) { $status.Text = "no launcher: start a run with run-highram.ps1"; return }
+    $answer = [System.Windows.Forms.MessageBox]::Show($form, "Close the game and start it again now?`n`n$again", 'VIctory', 'YesNo', 'Question')
     if ($answer -ne 'Yes') { return }
     Get-Process victory -ErrorAction SilentlyContinue | Stop-Process -Force
     for ($i = 0; $i -lt 40 -and (Get-Process victory -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 250 }
-    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$Launcher`""
-    $status.Text = 'restarting the game ...'
+    # (Encoded: the -More table's quotes and braces reach the new shell as written.)
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($again))
+    Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded
+    $status.Text = "restarting the game: $again"
 })
 $form.Controls.Add($restart)
 
@@ -220,6 +253,16 @@ $timer.Add_Tick({
             if ($t -ne $script:seenFile -and -not $dragging) {
                 $script:seenFile = $t
                 Load-Values
+            }
+        }
+        if (Test-Path -LiteralPath $launchPath) {
+            $l = (Get-Item -LiteralPath $launchPath).LastWriteTimeUtc
+            if ($l -ne $script:seenLaunch) {
+                $script:seenLaunch = $l
+                $again = Get-Again
+                $restart.Text = Get-AgainLabel $again
+                $restart.Enabled = [bool]$again
+                $tips.SetToolTip($restart, $again)
             }
         }
         if (Test-Path -LiteralPath $renderPath) {

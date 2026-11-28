@@ -771,6 +771,130 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     }
 }
 
+/// The thread of ours that walks another thread's stack now ([`unwind_other`]),
+/// 0 for none.
+#[cfg(feature = "diagnostics")]
+static WALKER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Whether its walk ended on a read that faulted.
+#[cfg(feature = "diagnostics")]
+static WALK_FAULTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// One walk at a time (the registers below are one set).
+#[cfg(feature = "diagnostics")]
+static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The walker's registers as they were when its walk began: where it goes on
+/// if a read of the walk faults.
+#[cfg(feature = "diagnostics")]
+struct Resume(std::cell::UnsafeCell<Aligned16>);
+// SAFETY: written and read by the one walker ([`WALKING`]), and by the handler
+// on that same thread.
+#[cfg(feature = "diagnostics")]
+unsafe impl Sync for Resume {}
+// SAFETY: a zeroed CONTEXT is valid.
+#[cfg(feature = "diagnostics")]
+static RESUME: Resume = Resume(std::cell::UnsafeCell::new(Aligned16(unsafe { std::mem::zeroed() })));
+
+#[cfg(feature = "diagnostics")]
+const STATUS_GUARD_PAGE_VIOLATION: i32 = 0x8000_0001_u32 as i32;
+
+/// [`unwind_into`] for a thread that is suspended somewhere we do not know:
+/// between two instructions of a prologue the unwind data does not describe,
+/// in code that has none, with a frame pointer that is not one yet. The
+/// system's unwinder then reads where those registers point, which need not be
+/// the thread's stack at all, and the read faulted in the sampling profiler's
+/// thread and ended the process (run 20261127-143335: `read 0xcc504019b8:
+/// reserved, never committed` in `RtlVirtualUnwind`, 52 s and some 700,000
+/// walks into a profile). Here such a read ends the walk and nothing else: the
+/// frames found until then are kept. Returns whether the walk ended by itself.
+///
+/// Nothing between the capture and the end allocates or takes a lock (the
+/// suspended thread may hold any), and so does the handler.
+#[cfg(feature = "diagnostics")]
+#[inline(never)]
+pub(crate) fn unwind_other(context: &CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureContext;
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    static HANDLER: std::sync::Once = std::sync::Once::new();
+    // Ahead of every handler there is (the write guards' looks at the address
+    // under its lock, which the suspended thread may hold).
+    // SAFETY: the handler only looks at statics of ours and the context.
+    HANDLER.call_once(|| unsafe {
+        AddVectoredExceptionHandler(1, Some(walk_fault));
+    });
+    if WALKING.swap(true, SeqCst) {
+        return false;
+    }
+    WALK_FAULTED.store(false, SeqCst);
+    // SAFETY: writes this thread's registers as they are when the call
+    // returns; ours alone while `WALKING` is set.
+    unsafe { RtlCaptureContext(RESUME.0.get().cast()) };
+    // A faulted walk comes back to this line ([`walk_fault`]), as a `longjmp`
+    // does: with the registers a call keeps as they were here, and this
+    // function's frame as it is.
+    if WALK_FAULTED.load(SeqCst) {
+        WALKING.store(false, SeqCst);
+        return false;
+    }
+    // SAFETY: plain query.
+    WALKER.store(unsafe { GetCurrentThreadId() }, SeqCst);
+    unwind_into(*context, low, high, frames);
+    WALKER.store(0, SeqCst);
+    WALKING.store(false, SeqCst);
+    true
+}
+
+/// The vectored handler for [`unwind_other`]: an access fault of the walking
+/// thread sends it back to where its walk began.
+#[cfg(feature = "diagnostics")]
+unsafe extern "system" fn walk_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    let walker = WALKER.load(SeqCst);
+    // SAFETY: plain query.
+    if walker == 0 || walker != unsafe { GetCurrentThreadId() } {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: the system passes the exception being dispatched.
+    let record = unsafe { &*(*info).ExceptionRecord };
+    let guard = record.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION;
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && !guard {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // The read was of the other thread's guard page, which the system took the
+    // guard from: put back, or that thread's stack cannot grow past it.
+    if guard && record.NumberParameters >= 2 {
+        let page = record.ExceptionInformation[1] & !0xfff;
+        let mut old = 0;
+        // SAFETY: a page of a stack of this process, as it was before the read.
+        unsafe { VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old) };
+    }
+    WALKER.store(0, SeqCst);
+    WALK_FAULTED.store(true, SeqCst);
+    // SAFETY: the faulting thread's context, ours to change; `RESUME` was
+    // written by this thread before it set `WALKER`.
+    unsafe {
+        let now = &mut *(*info).ContextRecord;
+        let then = &(*RESUME.0.get()).0;
+        (now.Rip, now.Rsp, now.Rbp, now.Rbx, now.Rsi, now.Rdi) =
+            (then.Rip, then.Rsp, then.Rbp, then.Rbx, then.Rsi, then.Rdi);
+        (now.R12, now.R13, now.R14, now.R15) = (then.R12, then.R13, then.R14, then.R15);
+        now.MxCsr = then.MxCsr;
+        now.Anonymous.Anonymous.Xmm6 = then.Anonymous.Anonymous.Xmm6;
+        now.Anonymous.Anonymous.Xmm7 = then.Anonymous.Anonymous.Xmm7;
+        now.Anonymous.Anonymous.Xmm8 = then.Anonymous.Anonymous.Xmm8;
+        now.Anonymous.Anonymous.Xmm9 = then.Anonymous.Anonymous.Xmm9;
+        now.Anonymous.Anonymous.Xmm10 = then.Anonymous.Anonymous.Xmm10;
+        now.Anonymous.Anonymous.Xmm11 = then.Anonymous.Anonymous.Xmm11;
+        now.Anonymous.Anonymous.Xmm12 = then.Anonymous.Anonymous.Xmm12;
+        now.Anonymous.Anonymous.Xmm13 = then.Anonymous.Anonymous.Xmm13;
+        now.Anonymous.Anonymous.Xmm14 = then.Anonymous.Anonymous.Xmm14;
+        now.Anonymous.Anonymous.Xmm15 = then.Anonymous.Anonymous.Xmm15;
+    }
+    -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
 /// `module+rva`, or the bare address.
 pub fn locate(address: usize) -> String {
     module_of(address).unwrap_or_else(|| format!("{address:#x}"))
@@ -848,6 +972,39 @@ mod tests {
 
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);
+
+    /// A walk whose stack pointer leads into memory that is not there ends,
+    /// with the frame it had, and the thread goes on; the next walk works.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_walk_of_another_thread_that_reads_nothing_ends_without_a_fault() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        // SAFETY: reserves address space and commits none of it.
+        let hole = unsafe { VirtualAlloc(null_mut(), 1 << 16, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert!(hole != 0);
+        for _ in 0..3 {
+            // SAFETY: a zeroed CONTEXT is valid.
+            let mut context = Aligned16(unsafe { std::mem::zeroed() });
+            // No function is at 16, so its return address is read at `Rsp`.
+            (context.0.Rip, context.0.Rsp) = (16, hole as u64 + 0x100);
+            let mut frames = Vec::with_capacity(MAX_FRAMES);
+            assert!(!unwind_other(&context.0, hole, hole + (1 << 16), &mut frames));
+            assert_eq!(frames, [16]);
+        }
+        // One that reads its own stack ends by itself.
+        let (mut low, mut high) = (0, 0);
+        // SAFETY: writes the current thread's stack bounds.
+        unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+        // SAFETY: as in `capture_frames`.
+        let mut context = Aligned16(unsafe { std::mem::zeroed() });
+        // SAFETY: writes the context.
+        unsafe { RtlCaptureContext(&mut context.0) };
+        let mut frames = Vec::with_capacity(MAX_FRAMES);
+        assert!(unwind_other(&context.0, low, high, &mut frames));
+        assert!(frames.len() >= 3, "{frames:?}");
+        // SAFETY: reserved above.
+        unsafe { VirtualFree(hole as *mut _, 0, MEM_RELEASE) };
+    }
 
     /// A frame we expect [`unwind`] to report: the helper it is in, and the
     /// helper's name for the message.

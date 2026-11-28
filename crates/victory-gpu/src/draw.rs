@@ -1319,7 +1319,21 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
+        // (A builder program given the title's geometry descriptions, an SRV
+        // of 48-byte records, `crate::records`: what they point at.)
+        let geometry: Vec<u64> = if crate::pipeline::is_builder(self.pipeline as This) {
+            t.used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Descriptor && u.stride == crate::records::RECORD as u32)
+                .filter_map(|u| match self.roots_ref(compute).get(usize::from(u.slot)) {
+                    Some(&Root::View(address)) => Some(address),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        crate::memory::ready(list, heap, &addresses, &written, &constants, &geometry, use_, t.threads)
     }
 
     /// The bound heap holding `handle`.
@@ -1569,6 +1583,19 @@ impl State {
                 } else {
                     crate::memory::Use::Reads
                 };
+                // (The unpacking programs' inputs, for the native builder.)
+                #[cfg(feature = "diagnostics")]
+                if crate::memory::capture::on() {
+                    let views: Vec<u64> =
+                        self.roots_ref(compute).iter().filter_map(|r| if let Root::View(a) = r { Some(*a) } else { None }).collect();
+                    let constants: Vec<u32> = self
+                        .roots_ref(compute)
+                        .iter()
+                        .filter_map(|r| if let Root::Constants(c) = r { Some(c.clone()) } else { None })
+                        .flatten()
+                        .collect();
+                    crate::memory::capture::dispatch(&stage.shader.hash, crate::frame::current(), &views, &constants);
+                }
                 let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;

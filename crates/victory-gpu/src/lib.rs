@@ -20,6 +20,10 @@ mod ambient;
 // The title's ray-tracing structures as flat lists, for host (DXR) structures: not used yet.
 #[allow(dead_code)]
 mod bvh_flat;
+// The title's geometry descriptions for the console's structure builder,
+// decoded (the native builder, plan #2): not used by the runtime yet.
+#[allow(dead_code)]
+mod records;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 // The in-game debugger, `VICTORY_DEBUGGER=<folder>` (from victory-corgi).
@@ -31,6 +35,9 @@ pub mod console;
 mod compose;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+// Our own blocks from a heap for each thread (VICTORY_OWN_HEAPS).
+#[cfg(all(windows, feature = "diagnostics"))]
+mod heaps;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]

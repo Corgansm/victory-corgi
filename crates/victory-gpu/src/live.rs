@@ -165,9 +165,9 @@ pub(crate) const SPECS: [Spec; COUNT] = [
     },
     Spec {
         name: "VICTORY_RAY_TRACING",
-        label: "Ray tracing: 2 RTX, 1 title, 0 off",
+        label: "Ray tracing: 3 RTX fast, 2 RTX, 1 title, 0 off",
         least: 0.0,
-        most: 2.0,
+        most: 3.0,
         step: 1.0,
         switch: false,
         // What the run was started with (`run-highram.ps1 -Guided`, `-RT`).
@@ -190,17 +190,36 @@ pub(crate) const SPECS: [Spec; COUNT] = [
         step: 5.0,
         switch: false,
         // (`crate::frame`: the title's own interval is 30 a second.)
-        start: || env_number("VICTORY_FRAME_CAP").filter(|v| (30.0..=240.0).contains(v)).unwrap_or(30.0),
+        // The file's, as the last run left it (a cap set in the menus went
+        // back to 30 at every start), else the launcher's.
+        start: || {
+            file_number("VICTORY_FRAME_CAP")
+                .or_else(|| env_number("VICTORY_FRAME_CAP"))
+                .filter(|v| (30.0..=240.0).contains(v))
+                .unwrap_or(30.0)
+        },
     },
 ];
 
-/// The live switch of ray tracing, when a menu has moved it: 2 the host's
+/// A setting's label in the menus. The ray-tracing switch says so where it can
+/// do nothing: its three settings choose among walks that only a run started
+/// with `VICTORY_DXR_GUIDED=1` (`run-highram.ps1 -Guided`) has translated and
+/// builds structures for, and in any other run the slider moved and the
+/// picture stayed as it was.
+fn label(n: usize) -> &'static str {
+    static GUIDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let guided = *GUIDED.get_or_init(|| std::env::var_os("VICTORY_DXR_GUIDED").is_some_and(|v| v == "1"));
+    if n == RAY_TRACING && !guided { "Ray tracing: needs a -Guided start" } else { SPECS[n].label }
+}
+
+/// The live switch of ray tracing, when a menu has moved it: 3 the host's
+/// structures alone (a ray they miss is a miss), 2 the host's
 /// structures guide the title's walks (as `VICTORY_DXR_GUIDED` translates
 /// them), 1 the title's own walk only, 0 off (every node missed, and the
 /// stand-in for the indirect light on, `crate::ambient`). Works in a run
 /// whose trace programs were translated with `VICTORY_DXR_GUIDED=1`.
 pub(crate) fn ray_tracing() -> Option<u32> {
-    get(RAY_TRACING).map(|v| v.round().clamp(0.0, 2.0) as u32)
+    get(RAY_TRACING).map(|v| v.round().clamp(0.0, 3.0) as u32)
 }
 
 /// Each setting's value now and the run's own, as bits.
@@ -235,8 +254,8 @@ pub(crate) fn start() {
             START[n].store(v.to_bits(), Relaxed);
         }
         let mut menu = String::new();
-        for s in &SPECS {
-            menu += &format!("{}|{}|{}|{}|{}|{}\n", s.name, s.label, s.least, s.most, s.step, u8::from(s.switch));
+        for (n, s) in SPECS.iter().enumerate() {
+            menu += &format!("{}|{}|{}|{}|{}|{}\n", s.name, label(n), s.least, s.most, s.step, u8::from(s.switch));
         }
         if let Some(at) = beside(".menu")
             && let Err(e) = std::fs::write(&at, menu)
@@ -255,6 +274,16 @@ pub(crate) fn get(n: usize) -> Option<f32> {
     start();
     let now = NOW[n].load(Relaxed);
     (file().is_some() && GENERATION[n].load(Relaxed) > 0 && now != START[n].load(Relaxed)).then(|| f32::from_bits(now))
+}
+
+/// A setting's value now, moved by a menu or not, when the menus are on. For a
+/// setting whose start is the file's (the frame rate cap): [`get`] says
+/// nothing of a value that is the run's own, so a cap of 120 kept from the
+/// last run showed in the menus and did not hold (run 20261127-153354: 30 a
+/// second), nor did one moved away and back to it.
+pub(crate) fn value(n: usize) -> Option<f32> {
+    start();
+    file().is_some().then(|| f32::from_bits(NOW[n].load(Relaxed)))
 }
 
 /// As [`get`], once for each change, with `seen` the caller's own count.
@@ -661,7 +690,7 @@ mod overlay {
                 let v = now(n);
                 let changed = super::NOW[n].load(Relaxed) != super::START[n].load(Relaxed);
                 SetTextColor(dc, COLORREF(if changed { 0x0040_D0FF } else { 0x00E6_E6E6 }));
-                text(dc, spec.label, RECT { left: 10, top: y, right: BAR.0 - 6, bottom: y + ROW }, DT_LEFT);
+                text(dc, super::label(n), RECT { left: 10, top: y, right: BAR.0 - 6, bottom: y + ROW }, DT_LEFT);
                 let mid = y + ROW / 2;
                 if spec.switch {
                     let on = v >= 0.5;

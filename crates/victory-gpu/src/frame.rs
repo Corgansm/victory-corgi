@@ -63,7 +63,7 @@ fn capped(title: Duration) -> Duration {
         good.then_some(cap)
     });
     #[cfg(windows)]
-    let asked = crate::live::get(crate::live::FRAME_CAP).or(asked);
+    let asked = crate::live::value(crate::live::FRAME_CAP).or(asked);
     match asked {
         Some(cap) if cap > 30.5 => Duration::from_secs_f32(1.0 / cap.clamp(30.0, 240.0)),
         _ => title,

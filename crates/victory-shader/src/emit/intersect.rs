@@ -216,7 +216,8 @@ impl<'a> Lower<'a> {
         };
         // The live switch (`VICTORY_RAY_TRACING`, the host's table's last
         // dword): 0 as translated, 1 the title's own walk only, 2 every node
-        // missed. A host without the table reads 0.
+        // missed, 3 the host's structures alone ([`Lower::bvh_guided`]). A
+        // host without the table reads 0.
         let guided = match structure.filter(|_| dxr_guided()) {
             Some((key, key_high)) => {
                 let (base, table) = self.dxr_table();
@@ -325,9 +326,9 @@ impl<'a> Lower<'a> {
         use crate::emit::{DXR_ENTRIES, DXR_HASH, DXR_TOP, MEMORY_RUN};
         let c = self.cur;
         // The entry: the hash's place, then the next three.
-        let (k_hash, k22) = (self.s.m.i32(DXR_HASH), self.s.m.i32(22));
+        let (k_hash, k_shift) = (self.s.m.i32(DXR_HASH), self.s.m.i32(crate::emit::DXR_HASH_SHIFT));
         let hash = self.s.m.bin(c, Bin::Mul, structure, k_hash);
-        let hash = self.s.m.bin(c, Bin::LShr, hash, k22);
+        let hash = self.s.m.bin(c, Bin::LShr, hash, k_shift);
         let (undef, align, mask) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4), self.s.m.i8(0xf));
         let (k_last, k4) = (self.s.m.i32(DXR_ENTRIES - 1), self.s.m.i32(4));
         let zero = self.s.m.i32(0);
@@ -357,8 +358,11 @@ impl<'a> Lower<'a> {
         // (The key is the root's absolute pointer: found is at the root.)
         let nonzero = self.s.m.cmp(c, pred::NE, structure, zero);
         let guided = self.s.m.bin(c, Bin::And, found, nonzero);
-        // (Only with the switch at 0: as translated.)
+        // (Only with the switch at 0, as translated, or 3, the host's alone.)
         let as_built = self.s.m.cmp(c, pred::EQ, mode, zero);
+        let k_alone = self.s.m.i32(3);
+        let alone = self.s.m.cmp(c, pred::EQ, mode, k_alone);
+        let as_built = self.s.m.bin(c, Bin::Or, as_built, alone);
         let guided = self.s.m.bin(c, Bin::And, guided, as_built);
         let (query_block, emulated_block, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
         self.s.m.terminate(c, Term::CondBr(guided, query_block, emulated_block));
@@ -444,11 +448,24 @@ impl<'a> Lower<'a> {
             }
         }
         let none = self.s.m.i32(bvh::NONE);
-        let guided = [child, none, none, none];
         // A miss in the host's structure (it may hold only part of the
         // title's: what is built so far) is not taken for a miss: the
-        // title's own walk of the node instead.
-        self.s.m.terminate(q, Term::CondBr(hit, join, emulated_block));
+        // title's own walk of the node instead. But for a bottom level the
+        // host holds whole (`DXR_BOTTOM_WHOLE`): there a miss is one.
+        // With the switch at 3 every miss in the host's structures is one:
+        // what they lack (instances whose bottom level is not built yet, or
+        // not readable) casts no shadow and shows in no reflection. A top
+        // level's miss walked the title's whole tree after the query, and
+        // most rays miss: with the host's top levels holding a third to a
+        // half of a scene's instances, guided walks cost the card more than
+        // the title's alone (run 20261127-161843: 80-170 ms a frame).
+        let k_whole = self.s.m.i32(crate::emit::DXR_BOTTOM_WHOLE);
+        let whole = self.s.m.cmp(q, pred::EQ, kind, k_whole);
+        let answered = self.s.m.bin(q, Bin::Or, hit, whole);
+        let answered = self.s.m.bin(q, Bin::Or, answered, alone);
+        let child = self.s.m.select(q, hit, child, none);
+        let guided = [child, none, none, none];
+        self.s.m.terminate(q, Term::CondBr(answered, join, emulated_block));
 
         self.cur = emulated_block;
         let own = emulated(self);
