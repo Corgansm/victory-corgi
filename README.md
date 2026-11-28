@@ -18,6 +18,7 @@ The sections after it are the parent fork's own, as it wrote them on 2026-11-25 
 
 | | |
 |---|---|
+| Loading screens and videos | **120 fps** (with the frame rate cap at 120, `VICTORY_FRAME_CAP`) |
 | Without ray tracing, first mission, on the boat | **25-30 fps** |
 | Without ray tracing, cutscenes | **20-45 fps** |
 | Without ray tracing, open world | about **15-20 fps** |
